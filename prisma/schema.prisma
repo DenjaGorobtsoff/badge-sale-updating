@@ -1,13 +1,7 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
   provider = "postgresql"
   url      = env("bsu_DATABASE_URL")
@@ -31,4 +25,66 @@ model Session {
   emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+model SaleBadgeSyncJob {
+  id     String @id @default(cuid())
+  shop   String
+  type   String @default("DRY_RUN")
+  status String @default("RUNNING")
+
+  // Shopify pagination cursor.
+  // Allows us to continue scanning the catalog page by page.
+  cursor String?
+
+  // Statistics for this scan.
+  checked     Int @default(0)
+  changes     Int @default(0)
+  addCount    Int @default(0)
+  removeCount Int @default(0)
+  failed      Int @default(0)
+
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  lastError  String?
+
+  // Variants that require a SALE badge change.
+  items SaleBadgeSyncItem[]
+
+  @@index([shop, type, startedAt])
+  @@index([shop, status])
+}
+
+model SaleBadgeSyncItem {
+  id String @id @default(cuid())
+
+  jobId String
+
+  variantId String
+  productId String
+
+  productTitle String
+  variantTitle String
+
+  sku String?
+
+  price          String
+  compareAtPrice String?
+
+  // ADD_SALE or REMOVE_SALE
+  action String
+
+  isOnSale     Boolean
+  hasSaleBadge Boolean
+
+  createdAt DateTime @default(now())
+
+  job SaleBadgeSyncJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // The same variant must not be added twice
+  // within the same scan.
+  @@unique([jobId, variantId])
+  @@index([jobId, action])
+  @@index([jobId, createdAt])
+  @@index([jobId, productId])
 }

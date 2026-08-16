@@ -1,10 +1,16 @@
 import {
-  Form,
-  useActionData,
+  Link,
+  useFetcher,
   useLoaderData,
-  useNavigation,
 } from "react-router";
 
+import {
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+
+import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 
 const SALE_BADGE_GID =
@@ -12,7 +18,15 @@ const SALE_BADGE_GID =
 
 const BADGE_NAMESPACE = "custom";
 const BADGE_KEY = "product_badges";
-const BADGE_TYPE = "list.metaobject_reference";
+
+const PAGE_SIZE = 250;
+const LIST_PAGE_SIZE = 50;
+
+const VALID_FILTERS = new Set([
+  "ALL",
+  "ADD_SALE",
+  "REMOVE_SALE",
+]);
 
 function parseBadges(value) {
   if (!value) {
@@ -23,7 +37,10 @@ function parseBadges(value) {
     const parsed = JSON.parse(value);
 
     return Array.isArray(parsed)
-      ? parsed
+      ? parsed.filter(
+        (item) =>
+          typeof item === "string",
+      )
       : [];
   } catch {
     return [];
@@ -72,451 +89,306 @@ function analyseVariant(variant) {
   }
 
   return {
-    badges,
-    price,
-    compareAtPrice,
     isOnSale,
     hasSaleBadge,
     action,
   };
 }
 
-async function updateSingleVariant(
-  admin,
-  variantId,
-) {
-  const response =
-    await admin.graphql(
-      `#graphql
-        query VariantForSaleBadgeUpdate(
-          $id: ID!
-        ) {
-          productVariant(id: $id) {
-            id
-            title
-            sku
-            price
-            compareAtPrice
+function numericId(gid) {
+  return gid
+    ?.split("/")
+    .pop();
+}
 
-            product {
-              id
-              title
-            }
-
-            metafield(
-              namespace: "${BADGE_NAMESPACE}"
-              key: "${BADGE_KEY}"
-            ) {
-              id
-              type
-              value
-              compareDigest
-            }
-          }
-        }
-      `,
-      {
-        variables: {
-          id: variantId,
-        },
-      },
+function normalizePage(value) {
+  const page =
+    Number.parseInt(
+      value || "1",
+      10,
     );
 
-  const json =
-    await response.json();
+  return Number.isFinite(page) &&
+  page > 0
+    ? page
+    : 1;
+}
 
-  if (
-    json.errors?.length
-  ) {
-    console.error(
-      "Variant read errors:",
-      json.errors,
-    );
-
-    return {
-      success: false,
-      skipped: false,
-      variantId,
-      action: null,
-      message:
-        "Could not read variant.",
-    };
-  }
-
-  const variant =
-    json.data.productVariant;
-
-  if (!variant) {
-    return {
-      success: false,
-      skipped: false,
-      variantId,
-      action: null,
-      message:
-        "Variant was not found.",
-    };
-  }
-
-  const analysis =
-    analyseVariant(variant);
-
-  if (
-    analysis.action ===
-    "NONE"
-  ) {
-    return {
-      success: true,
-      skipped: true,
-      variantId,
-      action: "NONE",
-      message:
-        `${variant.product.title} / ` +
-        `${variant.title}: ` +
-        `no update required.`,
-    };
-  }
-
-  let nextBadges;
-
-  if (
-    analysis.action ===
-    "ADD_SALE"
-  ) {
-    nextBadges = [
-      ...analysis.badges,
-      SALE_BADGE_GID,
-    ];
-  } else {
-    nextBadges =
-      analysis.badges.filter(
-        (gid) =>
-          gid !==
-          SALE_BADGE_GID,
-      );
-  }
-
-  nextBadges = [
-    ...new Set(
-      nextBadges,
-    ),
-  ];
-
-  const metafieldInput = {
-    ownerId:
-    variant.id,
-
-    namespace:
-    BADGE_NAMESPACE,
-
-    key:
-    BADGE_KEY,
-
-    type:
-    BADGE_TYPE,
-
-    value:
-      JSON.stringify(
-        nextBadges,
-      ),
-  };
-
-  if (
-    variant.metafield
-      ?.compareDigest
-  ) {
-    metafieldInput.compareDigest =
-      variant.metafield
-        .compareDigest;
-  }
-
-  const mutationResponse =
-    await admin.graphql(
-      `#graphql
-        mutation UpdateSaleBadge(
-          $metafields:
-            [MetafieldsSetInput!]!
-        ) {
-          metafieldsSet(
-            metafields:
-              $metafields
-          ) {
-            metafields {
-              id
-              namespace
-              key
-              type
-              value
-              compareDigest
-            }
-
-            userErrors {
-              field
-              message
-              code
-            }
-          }
-        }
-      `,
-      {
-        variables: {
-          metafields: [
-            metafieldInput,
-          ],
-        },
-      },
-    );
-
-  const mutationJson =
-    await mutationResponse.json();
-
-  if (
-    mutationJson.errors
-      ?.length
-  ) {
-    console.error(
-      "Mutation errors:",
-      mutationJson.errors,
-    );
-
-    return {
-      success: false,
-      skipped: false,
-      variantId:
-      variant.id,
-      action:
-      analysis.action,
-      message:
-        "GraphQL mutation failed.",
-    };
-  }
-
-  const result =
-    mutationJson.data
-      .metafieldsSet;
-
-  if (
-    result.userErrors
-      ?.length
-  ) {
-    console.error(
-      "MetafieldsSet errors:",
-      result.userErrors,
-    );
-
-    return {
-      success: false,
-      skipped: false,
-      variantId:
-      variant.id,
-      action:
-      analysis.action,
-      message:
-        result.userErrors
-          .map(
-            (error) =>
-              error.message,
-          )
-          .join(", "),
-    };
+function serializeJob(job) {
+  if (!job) {
+    return null;
   }
 
   return {
-    success: true,
-    skipped: false,
-    variantId:
-    variant.id,
-    action:
-    analysis.action,
+    id: job.id,
+    shop: job.shop,
+    type: job.type,
+    status: job.status,
+    checked: job.checked,
+    changes: job.changes,
+    addCount: job.addCount,
+    removeCount:
+    job.removeCount,
+    failed: job.failed,
 
-    message:
-      `${analysis.action} completed for ` +
-      `${variant.product.title} / ` +
-      `${variant.title}.`,
+    startedAt:
+      job.startedAt
+        ?.toISOString?.() ??
+      job.startedAt,
+
+    finishedAt:
+      job.finishedAt
+        ?.toISOString?.() ??
+      job.finishedAt,
+
+    lastError:
+    job.lastError,
   };
 }
+
+/*
+|--------------------------------------------------------------------------
+| LOADER
+|--------------------------------------------------------------------------
+|
+| Reads the latest Dry Run job from PostgreSQL.
+| It does NOT scan Shopify here.
+|
+| It also loads only 50 detected changes at a time.
+|
+*/
 
 export const loader =
   async ({ request }) => {
     const {
-      admin,
       session,
     } =
       await authenticate.admin(
         request,
       );
 
-    const response =
-      await admin.graphql(
-        `#graphql
-          query SaleBadgeDryRun {
-            productVariants(
-              first: 250
-              sortKey: ID
-            ) {
-              nodes {
-                id
-                title
-                sku
-                price
-                compareAtPrice
+    const url =
+      new URL(request.url);
 
-                product {
-                  id
-                  title
-                }
-
-                metafield(
-                  namespace: "${BADGE_NAMESPACE}"
-                  key: "${BADGE_KEY}"
-                ) {
-                  id
-                  type
-                  value
-                }
-              }
-
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
-            }
-          }
-        `,
-      );
-
-    const json =
-      await response.json();
-
-    if (
-      json.errors?.length
-    ) {
-      console.error(
-        "Loader errors:",
-        json.errors,
-      );
-
-      throw new Response(
-        JSON.stringify(
-          json.errors,
+    const page =
+      normalizePage(
+        url.searchParams.get(
+          "page",
         ),
+      );
+
+    const requestedFilter =
+      (
+        url.searchParams.get(
+          "filter",
+        ) || "ALL"
+      ).toUpperCase();
+
+    const filter =
+      VALID_FILTERS.has(
+        requestedFilter,
+      )
+        ? requestedFilter
+        : "ALL";
+
+    /*
+     * Get the latest Dry Run.
+     */
+    const job =
+      await prisma.saleBadgeSyncJob.findFirst(
         {
-          status: 500,
+          where: {
+            shop:
+            session.shop,
+
+            type:
+              "DRY_RUN",
+          },
+
+          orderBy: {
+            startedAt:
+              "desc",
+          },
         },
       );
+
+    /*
+     * No Dry Run has been started yet.
+     */
+    if (!job) {
+      return {
+        job: null,
+
+        affectedProducts: 0,
+
+        items: [],
+
+        listTotal: 0,
+
+        page: 1,
+
+        totalPages: 0,
+
+        filter,
+
+        storeHandle:
+          session.shop.replace(
+            ".myshopify.com",
+            "",
+          ),
+      };
     }
 
-    const allVariants =
-      json.data
-        .productVariants
-        .nodes
-        .map(
-          (variant) => {
-            const analysis =
-              analyseVariant(
-                variant,
-              );
+    const itemWhere = {
+      jobId: job.id,
 
-            return {
-              id:
-              variant.id,
+      ...(filter !== "ALL"
+        ? {
+          action:
+          filter,
+        }
+        : {}),
+    };
 
-              variantNumericId:
-                variant.id
-                  .split("/")
-                  .pop(),
+    /*
+     * Load:
+     *
+     * 1. Number of detected changes.
+     * 2. Current list page.
+     * 3. Unique products affected.
+     */
+    const [
+      listTotal,
+      items,
+      distinctProducts,
+    ] =
+      await prisma.$transaction(
+        [
+          prisma.saleBadgeSyncItem.count(
+            {
+              where:
+              itemWhere,
+            },
+          ),
 
-              productNumericId:
-                variant.product.id
-                  .split("/")
-                  .pop(),
+          prisma.saleBadgeSyncItem.findMany(
+            {
+              where:
+              itemWhere,
 
-              productTitle:
-              variant.product
-                .title,
+              orderBy: [
+                {
+                  productTitle:
+                    "asc",
+                },
 
-              variantTitle:
-              variant.title,
+                {
+                  variantTitle:
+                    "asc",
+                },
+              ],
 
-              sku:
-              variant.sku,
+              skip:
+                (page - 1) *
+                LIST_PAGE_SIZE,
 
-              price:
-              variant.price,
+              take:
+              LIST_PAGE_SIZE,
+            },
+          ),
 
-              compareAtPrice:
-              variant.compareAtPrice,
+          prisma.saleBadgeSyncItem.findMany(
+            {
+              where: {
+                jobId:
+                job.id,
+              },
 
-              badges:
-              analysis.badges,
+              distinct: [
+                "productId",
+              ],
 
-              isOnSale:
-              analysis.isOnSale,
-
-              hasSaleBadge:
-              analysis.hasSaleBadge,
-
-              action:
-              analysis.action,
-            };
-          },
-        );
-
-    const variants =
-      allVariants.filter(
-        (variant) =>
-          variant.action !==
-          "NONE",
+              select: {
+                productId:
+                  true,
+              },
+            },
+          ),
+        ],
       );
 
-    const addCount =
-      variants.filter(
-        (variant) =>
-          variant.action ===
-          "ADD_SALE",
-      ).length;
-
-    const removeCount =
-      variants.filter(
-        (variant) =>
-          variant.action ===
-          "REMOVE_SALE",
-      ).length;
-
-    const storeHandle =
-      session.shop.replace(
-        ".myshopify.com",
-        "",
+    const totalPages =
+      Math.ceil(
+        listTotal /
+        LIST_PAGE_SIZE,
       );
 
     return {
-      variants,
+      job:
+        serializeJob(job),
 
-      stats: {
-        checked:
-        allVariants.length,
+      /*
+       * Number of UNIQUE products
+       * that contain at least one
+       * problematic variant.
+       */
+      affectedProducts:
+      distinctProducts.length,
 
-        problems:
-        variants.length,
+      items:
+        items.map(
+          (item) => ({
+            ...item,
 
-        add:
-        addCount,
+            createdAt:
+              item.createdAt.toISOString(),
 
-        remove:
-        removeCount,
-      },
+            variantNumericId:
+              numericId(
+                item.variantId,
+              ),
 
-      pageInfo:
-      json.data
-        .productVariants
-        .pageInfo,
+            productNumericId:
+              numericId(
+                item.productId,
+              ),
+          }),
+        ),
 
-      storeHandle,
+      listTotal,
+
+      page,
+
+      totalPages,
+
+      filter,
+
+      storeHandle:
+        session.shop.replace(
+          ".myshopify.com",
+          "",
+        ),
     };
   };
 
+/*
+|--------------------------------------------------------------------------
+| ACTION
+|--------------------------------------------------------------------------
+|
+| Handles:
+|
+| startDryRun
+| processDryRun
+|
+*/
+
 export const action =
   async ({ request }) => {
-    const { admin } =
+    const {
+      admin,
+      session,
+    } =
       await authenticate.admin(
         request,
       );
@@ -529,762 +401,1485 @@ export const action =
         "intent",
       );
 
+    /*
+    |--------------------------------------------------------------------------
+    | START FULL DRY RUN
+    |--------------------------------------------------------------------------
+    */
+
     if (
-      intent === "single"
+      intent ===
+      "startDryRun"
     ) {
-      const variantId =
-        formData.get(
-          "variantId",
+      /*
+       * Prevent two Dry Runs from
+       * running simultaneously.
+       */
+      const runningJob =
+        await prisma.saleBadgeSyncJob.findFirst(
+          {
+            where: {
+              shop:
+              session.shop,
+
+              type:
+                "DRY_RUN",
+
+              status:
+                "RUNNING",
+            },
+
+            orderBy: {
+              startedAt:
+                "desc",
+            },
+          },
         );
 
-      if (
-        !variantId ||
-        typeof variantId !==
-        "string" ||
-        !variantId.startsWith(
-          "gid://shopify/ProductVariant/",
-        )
-      ) {
+      /*
+       * If a previous scan is still
+       * running, return it instead
+       * of creating another one.
+       */
+      if (runningJob) {
         return {
-          success: false,
-          mode: "single",
+          success: true,
+
+          intent,
 
           message:
-            "Invalid variant ID.",
+            "A dry run is already in progress. Resuming it.",
+
+          job:
+            serializeJob(
+              runningJob,
+            ),
         };
       }
 
-      const result =
-        await updateSingleVariant(
-          admin,
-          variantId,
+      /*
+       * Create new Dry Run.
+       */
+      const job =
+        await prisma.saleBadgeSyncJob.create(
+          {
+            data: {
+              shop:
+              session.shop,
+
+              type:
+                "DRY_RUN",
+
+              status:
+                "RUNNING",
+            },
+          },
         );
 
       return {
-        success:
-        result.success,
+        success: true,
 
-        mode: "single",
-
-        result,
+        intent,
 
         message:
-        result.message,
+          "Full catalog dry run started.",
+
+        job:
+          serializeJob(job),
       };
     }
 
+    /*
+    |--------------------------------------------------------------------------
+    | PROCESS ONE SHOPIFY PAGE
+    |--------------------------------------------------------------------------
+    |
+    | One request = maximum 250 variants.
+    |
+    | This is intentional.
+    |
+    | We do NOT attempt to process
+    | 50,000 variants in one Vercel request.
+    |
+    */
+
     if (
-      intent === "batch10"
+      intent ===
+      "processDryRun"
     ) {
-      const variantIds =
-        formData
-          .getAll(
-            "variantIds",
-          )
-          .filter(
-            (id) =>
-              typeof id ===
-              "string" &&
-              id.startsWith(
-                "gid://shopify/ProductVariant/",
-              ),
-          )
-          .slice(
-            0,
-            10,
-          );
+      const jobId =
+        formData.get(
+          "jobId",
+        );
 
       if (
-        variantIds.length ===
-        0
+        !jobId ||
+        typeof jobId !==
+        "string"
       ) {
         return {
           success: false,
-          mode: "batch",
+
+          intent,
 
           message:
-            "No variants were selected.",
+            "Missing dry run job ID.",
         };
       }
 
-      const results = [];
+      /*
+       * Make sure this job belongs
+       * to the current Shopify store.
+       */
+      const job =
+        await prisma.saleBadgeSyncJob.findFirst(
+          {
+            where: {
+              id: jobId,
 
-      for (
-        const variantId
-        of variantIds
-        ) {
-        try {
-          const result =
-            await updateSingleVariant(
-              admin,
-              variantId,
-            );
+              shop:
+              session.shop,
 
-          results.push(
-            result,
-          );
-        } catch (error) {
-          console.error(
-            "Batch item error:",
-            error,
-          );
+              type:
+                "DRY_RUN",
+            },
+          },
+        );
 
-          results.push({
-            success: false,
-            skipped: false,
-            variantId,
-            action: null,
+      if (!job) {
+        return {
+          success: false,
 
-            message:
-              error instanceof
-              Error
-                ? error.message
-                : "Unknown error.",
-          });
-        }
+          intent,
+
+          message:
+            "Dry run job was not found.",
+        };
       }
 
-      const updatedCount =
-        results.filter(
-          (item) =>
-            item.success &&
-            !item.skipped,
-        ).length;
+      /*
+       * Don't continue finished jobs.
+       */
+      if (
+        job.status !==
+        "RUNNING"
+      ) {
+        return {
+          success:
+            job.status ===
+            "COMPLETED",
 
-      const skippedCount =
-        results.filter(
-          (item) =>
-            item.skipped,
-        ).length;
+          intent,
 
-      const failedCount =
-        results.filter(
-          (item) =>
-            !item.success,
-        ).length;
+          message:
+            `Dry run is ${job.status.toLowerCase()}.`,
 
-      return {
-        success:
-          failedCount ===
-          0,
+          job:
+            serializeJob(job),
+        };
+      }
 
-        mode: "batch",
+      try {
+        /*
+         * Read next 250 variants.
+         */
+        const response =
+          await admin.graphql(
+            `#graphql
+              query FullSaleBadgeDryRun(
+                $first: Int!
+                $after: String
+              ) {
+                productVariants(
+                  first: $first
+                  after: $after
+                  sortKey: ID
+                ) {
+                  nodes {
+                    id
+                    title
+                    sku
+                    price
+                    compareAtPrice
 
-        results,
+                    product {
+                      id
+                      title
+                    }
 
-        stats: {
-          requested:
-          variantIds.length,
+                    metafield(
+                      namespace: "${BADGE_NAMESPACE}"
+                      key: "${BADGE_KEY}"
+                    ) {
+                      id
+                      type
+                      value
+                    }
+                  }
 
-          updated:
-          updatedCount,
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                }
+              }
+            `,
+            {
+              variables: {
+                first:
+                PAGE_SIZE,
 
-          skipped:
-          skippedCount,
+                after:
+                  job.cursor ||
+                  null,
+              },
+            },
+          );
 
-          failed:
-          failedCount,
-        },
+        const json =
+          await response.json();
 
-        message:
-          `Batch finished. ` +
-          `Updated: ${updatedCount}, ` +
-          `Skipped: ${skippedCount}, ` +
-          `Failed: ${failedCount}.`,
-      };
+        /*
+         * Shopify GraphQL errors.
+         */
+        if (
+          json.errors?.length
+        ) {
+          throw new Error(
+            json.errors
+              .map(
+                (error) =>
+                  error.message,
+              )
+              .join("; "),
+          );
+        }
+
+        const connection =
+          json.data
+            ?.productVariants;
+
+        if (!connection) {
+          throw new Error(
+            "Shopify response did not contain productVariants.",
+          );
+        }
+
+        let addCount = 0;
+        let removeCount = 0;
+
+        const problemItems =
+          [];
+
+        /*
+         * Analyse every variant.
+         */
+        for (
+          const variant
+          of connection.nodes
+          ) {
+          const analysis =
+            analyseVariant(
+              variant,
+            );
+
+          /*
+           * Correct state.
+           *
+           * We don't need to save
+           * this variant in DB.
+           */
+          if (
+            analysis.action ===
+            "NONE"
+          ) {
+            continue;
+          }
+
+          if (
+            analysis.action ===
+            "ADD_SALE"
+          ) {
+            addCount += 1;
+          }
+
+          if (
+            analysis.action ===
+            "REMOVE_SALE"
+          ) {
+            removeCount += 1;
+          }
+
+          /*
+           * Save only problematic variants.
+           */
+          problemItems.push(
+            {
+              jobId:
+              job.id,
+
+              variantId:
+              variant.id,
+
+              productId:
+              variant.product.id,
+
+              productTitle:
+              variant.product.title,
+
+              variantTitle:
+              variant.title,
+
+              sku:
+                variant.sku ||
+                null,
+
+              price:
+                String(
+                  variant.price,
+                ),
+
+              compareAtPrice:
+                variant.compareAtPrice !==
+                null
+                  ? String(
+                    variant.compareAtPrice,
+                  )
+                  : null,
+
+              action:
+              analysis.action,
+
+              isOnSale:
+              analysis.isOnSale,
+
+              hasSaleBadge:
+              analysis.hasSaleBadge,
+            },
+          );
+        }
+
+        const pageChecked =
+          connection.nodes.length;
+
+        const pageChanges =
+          problemItems.length;
+
+        const completed =
+          !connection.pageInfo
+            .hasNextPage;
+
+        /*
+         * Save:
+         *
+         * - problem variants
+         * - new cursor
+         * - statistics
+         *
+         * inside one DB transaction.
+         */
+        const updatedJob =
+          await prisma.$transaction(
+            async (tx) => {
+              if (
+                problemItems.length >
+                0
+              ) {
+                await tx.saleBadgeSyncItem.createMany(
+                  {
+                    data:
+                    problemItems,
+
+                    /*
+                     * Prevent duplicates
+                     * if the same page is
+                     * accidentally processed
+                     * twice.
+                     */
+                    skipDuplicates:
+                      true,
+                  },
+                );
+              }
+
+              return tx.saleBadgeSyncJob.update(
+                {
+                  where: {
+                    id:
+                    job.id,
+                  },
+
+                  data: {
+                    cursor:
+                      connection
+                        .pageInfo
+                        .endCursor ||
+                      job.cursor,
+
+                    checked: {
+                      increment:
+                      pageChecked,
+                    },
+
+                    changes: {
+                      increment:
+                      pageChanges,
+                    },
+
+                    addCount: {
+                      increment:
+                      addCount,
+                    },
+
+                    removeCount: {
+                      increment:
+                      removeCount,
+                    },
+
+                    status:
+                      completed
+                        ? "COMPLETED"
+                        : "RUNNING",
+
+                    finishedAt:
+                      completed
+                        ? new Date()
+                        : null,
+
+                    lastError:
+                      null,
+                  },
+                },
+              );
+            },
+          );
+
+        return {
+          success: true,
+
+          intent,
+
+          message:
+            completed
+              ? "Full catalog dry run completed."
+              : `Checked another ${pageChecked} variants.`,
+
+          job:
+            serializeJob(
+              updatedJob,
+            ),
+
+          page: {
+            checked:
+            pageChecked,
+
+            changes:
+            pageChanges,
+
+            add:
+            addCount,
+
+            remove:
+            removeCount,
+
+            hasNextPage:
+            connection
+              .pageInfo
+              .hasNextPage,
+          },
+        };
+      } catch (error) {
+        console.error(
+          "Full dry run error:",
+          error,
+        );
+
+        const message =
+          error instanceof
+          Error
+            ? error.message
+            : "Unknown dry run error.";
+
+        /*
+         * Store the failure in DB.
+         */
+        const failedJob =
+          await prisma.saleBadgeSyncJob.update(
+            {
+              where: {
+                id:
+                job.id,
+              },
+
+              data: {
+                status:
+                  "FAILED",
+
+                failed: {
+                  increment:
+                    1,
+                },
+
+                lastError:
+                message,
+
+                finishedAt:
+                  new Date(),
+              },
+            },
+          );
+
+        return {
+          success: false,
+
+          intent,
+
+          message,
+
+          job:
+            serializeJob(
+              failedJob,
+            ),
+        };
+      }
     }
 
     return {
       success: false,
+
+      intent,
 
       message:
         "Unknown action.",
     };
   };
 
+/*
+|--------------------------------------------------------------------------
+| PAGE
+|--------------------------------------------------------------------------
+*/
+
 export default function SaleSyncPage() {
   const {
-    variants,
-    stats,
-    pageInfo,
+    job,
+    affectedProducts,
+    items,
+    listTotal,
+    page,
+    totalPages,
+    filter,
     storeHandle,
   } =
     useLoaderData();
 
-  const actionData =
-    useActionData();
+  const scanFetcher =
+    useFetcher();
 
-  const navigation =
-    useNavigation();
+  const [
+    autoRunning,
+    setAutoRunning,
+  ] =
+    useState(false);
 
-  const submittingIntent =
-    navigation.formData?.get(
-      "intent",
+  /*
+   * Prefer the newest job state returned
+   * by useFetcher over the loader state.
+   */
+  const liveJob =
+    scanFetcher.data
+      ?.job ||
+    job;
+
+  const isSubmitting =
+    scanFetcher.state !==
+    "idle";
+
+  const progressMessage =
+    scanFetcher.data
+      ?.message;
+
+  /*
+  |--------------------------------------------------------------------------
+  | AUTOMATIC PAGE PROCESSING
+  |--------------------------------------------------------------------------
+  |
+  | Browser sends:
+  |
+  | processDryRun
+  |       ↓
+  | 250 variants
+  |       ↓
+  | response
+  |       ↓
+  | processDryRun
+  |       ↓
+  | next 250
+  |
+  */
+
+  useEffect(() => {
+    if (!autoRunning) {
+      return;
+    }
+
+    /*
+     * Wait until previous request
+     * has finished.
+     */
+    if (
+      scanFetcher.state !==
+      "idle"
+    ) {
+      return;
+    }
+
+    /*
+     * Stop automatically when job
+     * is completed or failed.
+     */
+    if (
+      !liveJob ||
+      liveJob.status !==
+      "RUNNING"
+    ) {
+      setAutoRunning(
+        false,
+      );
+
+      return;
+    }
+
+    /*
+     * Small pause between Shopify requests.
+     */
+    const timer =
+      window.setTimeout(
+        () => {
+          scanFetcher.submit(
+            {
+              intent:
+                "processDryRun",
+
+              jobId:
+              liveJob.id,
+            },
+            {
+              method:
+                "post",
+            },
+          );
+        },
+        250,
+      );
+
+    return () =>
+      window.clearTimeout(
+        timer,
+      );
+  }, [
+    autoRunning,
+    liveJob,
+    scanFetcher,
+    scanFetcher.state,
+  ]);
+
+  const status =
+    liveJob?.status ||
+    "NOT_STARTED";
+
+  const canStart =
+    !liveJob ||
+    [
+      "COMPLETED",
+      "FAILED",
+    ].includes(
+      liveJob.status,
     );
 
-  const submittingVariantId =
-    navigation.formData?.get(
-      "variantId",
-    );
+  const canResume =
+    liveJob?.status ===
+    "RUNNING";
 
-  const isBatchSubmitting =
-    navigation.state ===
-    "submitting" &&
-    submittingIntent ===
-    "batch10";
+  /*
+   * "Showing 1-50 of 3421"
+   */
+  const shownRange =
+    useMemo(() => {
+      if (
+        listTotal === 0
+      ) {
+        return "0";
+      }
+
+      const from =
+        (page - 1) *
+        LIST_PAGE_SIZE +
+        1;
+
+      const to =
+        Math.min(
+          page *
+          LIST_PAGE_SIZE,
+          listTotal,
+        );
+
+      return `${from}-${to}`;
+    }, [
+      page,
+      listTotal,
+    ]);
+
+  /*
+   * Preserve filter during pagination.
+   */
+  const buildListUrl =
+    (
+      nextPage,
+      nextFilter = filter,
+    ) => {
+      const params =
+        new URLSearchParams();
+
+      params.set(
+        "page",
+        String(nextPage),
+      );
+
+      params.set(
+        "filter",
+        nextFilter,
+      );
+
+      return `?${params.toString()}`;
+    };
 
   return (
     <s-page heading="SALE badge sync">
-      <s-section heading="Dry run / Controlled update">
+      <s-section heading="Full catalog dry run">
         <s-paragraph>
-          The first 250 variants are checked.
-          Only variants with an incorrect SALE badge
-          state are displayed.
+          This scan does not change Shopify data.
+          It checks the full variant catalog in pages
+          of 250 and stores only variants that require
+          a SALE badge change.
         </s-paragraph>
 
-        <s-paragraph>
-          You can update one variant at a time or apply
-          the first 10 detected problems.
-        </s-paragraph>
+        {/* CONTROLS */}
 
-        {actionData?.message && (
+        <div
+          style={{
+            display: "flex",
+            gap: "12px",
+            flexWrap: "wrap",
+            marginTop: "18px",
+            marginBottom: "18px",
+          }}
+        >
+          {canStart && (
+            <button
+              type="button"
+              disabled={
+                isSubmitting
+              }
+              onClick={() => {
+                setAutoRunning(
+                  true,
+                );
+
+                scanFetcher.submit(
+                  {
+                    intent:
+                      "startDryRun",
+                  },
+                  {
+                    method:
+                      "post",
+                  },
+                );
+              }}
+              style={
+                primaryButtonStyle
+              }
+            >
+              {isSubmitting
+                ? "Starting..."
+                : "Start full dry run"}
+            </button>
+          )}
+
+          {canResume &&
+            !autoRunning && (
+              <button
+                type="button"
+                disabled={
+                  isSubmitting
+                }
+                onClick={() => {
+                  setAutoRunning(
+                    true,
+                  );
+                }}
+                style={
+                  primaryButtonStyle
+                }
+              >
+                Resume dry run
+              </button>
+            )}
+
+          {autoRunning && (
+            <button
+              type="button"
+              onClick={() => {
+                setAutoRunning(
+                  false,
+                );
+              }}
+              style={
+                secondaryButtonStyle
+              }
+            >
+              Pause browser processing
+            </button>
+          )}
+        </div>
+
+        {/* STATISTICS */}
+
+        <div
+          style={{
+            display: "grid",
+
+            gridTemplateColumns:
+              "repeat(auto-fit, minmax(160px, 1fr))",
+
+            gap: "12px",
+
+            marginBottom:
+              "20px",
+          }}
+        >
+          <StatCard
+            label="Status"
+            value={
+              status
+            }
+          />
+
+          <StatCard
+            label="Variants checked"
+            value={
+              liveJob?.checked ??
+              0
+            }
+          />
+
+          <StatCard
+            label="Products affected"
+            value={
+              affectedProducts
+            }
+          />
+
+          <StatCard
+            label="Variants to change"
+            value={
+              liveJob?.changes ??
+              0
+            }
+          />
+
+          <StatCard
+            label="ADD SALE"
+            value={
+              liveJob?.addCount ??
+              0
+            }
+          />
+
+          <StatCard
+            label="REMOVE SALE"
+            value={
+              liveJob?.removeCount ??
+              0
+            }
+          />
+
+          <StatCard
+            label="Errors"
+            value={
+              liveJob?.failed ??
+              0
+            }
+          />
+        </div>
+
+        {/* PROGRESS */}
+
+        {(progressMessage ||
+          autoRunning) && (
           <div
             style={{
-              marginTop: "16px",
               marginBottom:
-                "16px",
-              padding:
-                "12px 16px",
+                "18px",
 
-              border: `1px solid ${
-                actionData.success
-                  ? "#008060"
-                  : "#d82c0d"
-              }`,
+              padding:
+                "12px 14px",
+
+              border:
+                "1px solid #c9cccf",
 
               borderRadius:
                 "8px",
 
               background:
-                actionData.success
-                  ? "#f1f8f5"
-                  : "#fff4f4",
+                "#f6f6f7",
             }}
           >
-            <strong>
-              {actionData.success
-                ? "Success"
-                : "Result"}
-            </strong>
-
-            <div
-              style={{
-                marginTop:
-                  "4px",
-              }}
-            >
-              {
-                actionData.message
-              }
-            </div>
+            {autoRunning &&
+            status ===
+            "RUNNING"
+              ? "Scanning catalog automatically. Keep this page open."
+              : progressMessage}
           </div>
         )}
 
-        {actionData?.mode ===
-          "batch" &&
-          actionData.stats && (
-            <div
-              style={{
-                marginBottom:
-                  "20px",
+        {/* ERROR */}
 
-                padding:
-                  "14px 16px",
-
-                border:
-                  "1px solid #ddd",
-
-                borderRadius:
-                  "8px",
-              }}
-            >
-              <strong>
-                Batch result
-              </strong>
-
-              <div
-                style={{
-                  display:
-                    "flex",
-                  gap: "20px",
-                  flexWrap:
-                    "wrap",
-
-                  marginTop:
-                    "10px",
-                }}
-              >
-                <span>
-                  Requested:{" "}
-                  {
-                    actionData
-                      .stats
-                      .requested
-                  }
-                </span>
-
-                <span>
-                  Updated:{" "}
-                  {
-                    actionData
-                      .stats
-                      .updated
-                  }
-                </span>
-
-                <span>
-                  Skipped:{" "}
-                  {
-                    actionData
-                      .stats
-                      .skipped
-                  }
-                </span>
-
-                <span>
-                  Failed:{" "}
-                  {
-                    actionData
-                      .stats
-                      .failed
-                  }
-                </span>
-              </div>
-            </div>
-          )}
-
-        <div
-          style={{
-            display: "flex",
-            gap: "20px",
-            marginTop:
-              "20px",
-            marginBottom:
-              "20px",
-            flexWrap: "wrap",
-          }}
-        >
-          <strong>
-            Checked:{" "}
-            {stats.checked}
-          </strong>
-
-          <strong>
-            Problems:{" "}
-            {stats.problems}
-          </strong>
-
-          <strong>
-            Add SALE:{" "}
-            {stats.add}
-          </strong>
-
-          <strong>
-            Remove SALE:{" "}
-            {stats.remove}
-          </strong>
-        </div>
-
-        {variants.length >
-          0 && (
-            <Form
-              method="post"
-            >
-              <input
-                type="hidden"
-                name="intent"
-                value="batch10"
-              />
-
-              {variants
-                .slice(
-                  0,
-                  10,
-                )
-                .map(
-                  (
-                    variant,
-                  ) => (
-                    <input
-                      key={
-                        variant.id
-                      }
-                      type="hidden"
-                      name="variantIds"
-                      value={
-                        variant.id
-                      }
-                    />
-                  ),
-                )}
-
-              <button
-                type="submit"
-                disabled={
-                  navigation.state ===
-                  "submitting"
-                }
-                style={{
-                  padding:
-                    "10px 16px",
-
-                  marginBottom:
-                    "20px",
-
-                  fontWeight:
-                    600,
-
-                  cursor:
-                    navigation.state ===
-                    "submitting"
-                      ? "wait"
-                      : "pointer",
-                }}
-              >
-                {isBatchSubmitting
-                  ? "Applying batch..."
-                  : `Apply first ${Math.min(
-                    variants.length,
-                    10,
-                  )} problems`}
-              </button>
-            </Form>
-          )}
-
-        {variants.length ===
-        0 ? (
+        {liveJob?.lastError && (
           <div
             style={{
+              marginBottom:
+                "18px",
+
               padding:
-                "20px",
+                "12px 14px",
 
               border:
-                "1px solid #ddd",
+                "1px solid #d82c0d",
 
               borderRadius:
                 "8px",
+
+              background:
+                "#fff4f4",
             }}
           >
-            No incorrect SALE
-            badges were found
-            in these variants.
-          </div>
-        ) : (
-          <div
-            style={{
-              overflowX:
-                "auto",
-            }}
-          >
-            <table
-              style={{
-                width:
-                  "100%",
-
-                borderCollapse:
-                  "collapse",
-              }}
-            >
-              <thead>
-              <tr>
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  Product
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  Variant
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  Variant ID
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  SKU
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  Price
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  Compare at
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  On sale?
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  SALE badge?
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  Action
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  Admin
-                </th>
-
-                <th
-                  style={
-                    cellStyle
-                  }
-                >
-                  Update
-                </th>
-              </tr>
-              </thead>
-
-              <tbody>
-              {variants.map(
-                (variant) => {
-                  const isSingleSubmitting =
-                    navigation.state ===
-                    "submitting" &&
-                    submittingIntent ===
-                    "single" &&
-                    submittingVariantId ===
-                    variant.id;
-
-                  return (
-                    <tr
-                      key={
-                        variant.id
-                      }
-                    >
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        {
-                          variant.productTitle
-                        }
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        {
-                          variant.variantTitle
-                        }
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        {
-                          variant.variantNumericId
-                        }
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        {variant.sku ||
-                          "-"}
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        {
-                          variant.price
-                        }
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        {variant.compareAtPrice ||
-                          "-"}
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        {variant.isOnSale
-                          ? "YES"
-                          : "NO"}
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        {variant.hasSaleBadge
-                          ? "YES"
-                          : "NO"}
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        <strong>
-                          {
-                            variant.action
-                          }
-                        </strong>
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        <a
-                          href={`https://admin.shopify.com/store/${storeHandle}/products/${variant.productNumericId}/variants/${variant.variantNumericId}`}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Open
-                        </a>
-                      </td>
-
-                      <td
-                        style={
-                          cellStyle
-                        }
-                      >
-                        <Form
-                          method="post"
-                        >
-                          <input
-                            type="hidden"
-                            name="intent"
-                            value="single"
-                          />
-
-                          <input
-                            type="hidden"
-                            name="variantId"
-                            value={
-                              variant.id
-                            }
-                          />
-
-                          <button
-                            type="submit"
-                            disabled={
-                              navigation.state ===
-                              "submitting"
-                            }
-                            style={{
-                              padding:
-                                "8px 14px",
-
-                              cursor:
-                                navigation.state ===
-                                "submitting"
-                                  ? "wait"
-                                  : "pointer",
-                            }}
-                          >
-                            {isSingleSubmitting
-                              ? "Applying..."
-                              : "Apply"}
-                          </button>
-                        </Form>
-                      </td>
-                    </tr>
-                  );
-                },
-              )}
-              </tbody>
-            </table>
+            <strong>
+              Last error:
+            </strong>{" "}
+            {
+              liveJob.lastError
+            }
           </div>
         )}
+      </s-section>
 
-        <div
-          style={{
-            marginTop:
-              "20px",
+      {/* RESULTS */}
 
-            fontSize:
-              "13px",
-          }}
-        >
-          More variants available:{" "}
-          {pageInfo.hasNextPage
-            ? "YES"
-            : "NO"}
-        </div>
+      <s-section heading="Detected changes">
+        {!job ? (
+          <s-paragraph>
+            Run the full dry run first. No Shopify data
+            will be changed.
+          </s-paragraph>
+        ) : (
+          <>
+            {/* FILTERS */}
+
+            <div
+              style={{
+                display:
+                  "flex",
+
+                gap:
+                  "10px",
+
+                flexWrap:
+                  "wrap",
+
+                marginBottom:
+                  "16px",
+              }}
+            >
+              <FilterLink
+                active={
+                  filter ===
+                  "ALL"
+                }
+                to={
+                  buildListUrl(
+                    1,
+                    "ALL",
+                  )
+                }
+              >
+                All (
+                {
+                  job.changes
+                }
+                )
+              </FilterLink>
+
+              <FilterLink
+                active={
+                  filter ===
+                  "ADD_SALE"
+                }
+                to={
+                  buildListUrl(
+                    1,
+                    "ADD_SALE",
+                  )
+                }
+              >
+                ADD SALE (
+                {
+                  job.addCount
+                }
+                )
+              </FilterLink>
+
+              <FilterLink
+                active={
+                  filter ===
+                  "REMOVE_SALE"
+                }
+                to={
+                  buildListUrl(
+                    1,
+                    "REMOVE_SALE",
+                  )
+                }
+              >
+                REMOVE SALE (
+                {
+                  job.removeCount
+                }
+                )
+              </FilterLink>
+            </div>
+
+            <div
+              style={{
+                marginBottom:
+                  "12px",
+              }}
+            >
+              Showing{" "}
+              {shownRange} of{" "}
+              {listTotal}
+            </div>
+
+            {/* TABLE */}
+
+            {items.length ===
+            0 ? (
+              <div
+                style={{
+                  padding:
+                    "20px",
+
+                  border:
+                    "1px solid #ddd",
+
+                  borderRadius:
+                    "8px",
+                }}
+              >
+                No detected changes
+                for this filter.
+              </div>
+            ) : (
+              <div
+                style={{
+                  overflowX:
+                    "auto",
+                }}
+              >
+                <table
+                  style={{
+                    width:
+                      "100%",
+
+                    borderCollapse:
+                      "collapse",
+                  }}
+                >
+                  <thead>
+                  <tr>
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      Product
+                    </th>
+
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      Variant
+                    </th>
+
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      SKU
+                    </th>
+
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      Price
+                    </th>
+
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      Compare at
+                    </th>
+
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      On sale?
+                    </th>
+
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      SALE badge?
+                    </th>
+
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      Action
+                    </th>
+
+                    <th
+                      style={
+                        cellStyle
+                      }
+                    >
+                      Admin
+                    </th>
+                  </tr>
+                  </thead>
+
+                  <tbody>
+                  {items.map(
+                    (item) => (
+                      <tr
+                        key={
+                          item.id
+                        }
+                      >
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          {
+                            item.productTitle
+                          }
+                        </td>
+
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          {
+                            item.variantTitle
+                          }
+                        </td>
+
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          {item.sku ||
+                            "-"}
+                        </td>
+
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          {
+                            item.price
+                          }
+                        </td>
+
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          {item.compareAtPrice ||
+                            "-"}
+                        </td>
+
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          {item.isOnSale
+                            ? "YES"
+                            : "NO"}
+                        </td>
+
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          {item.hasSaleBadge
+                            ? "YES"
+                            : "NO"}
+                        </td>
+
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          <strong>
+                            {
+                              item.action
+                            }
+                          </strong>
+                        </td>
+
+                        <td
+                          style={
+                            cellStyle
+                          }
+                        >
+                          <a
+                            href={`https://admin.shopify.com/store/${storeHandle}/products/${item.productNumericId}/variants/${item.variantNumericId}`}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Open
+                          </a>
+                        </td>
+                      </tr>
+                    ),
+                  )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* PAGINATION */}
+
+            {totalPages >
+              1 && (
+                <div
+                  style={{
+                    display:
+                      "flex",
+
+                    alignItems:
+                      "center",
+
+                    gap:
+                      "12px",
+
+                    marginTop:
+                      "18px",
+                  }}
+                >
+                  {page > 1 ? (
+                    <Link
+                      to={
+                        buildListUrl(
+                          page -
+                          1,
+                        )
+                      }
+                    >
+                      Previous
+                    </Link>
+                  ) : (
+                    <span>
+                    Previous
+                  </span>
+                  )}
+
+                  <strong>
+                    Page {page} of{" "}
+                    {totalPages}
+                  </strong>
+
+                  {page <
+                  totalPages ? (
+                    <Link
+                      to={
+                        buildListUrl(
+                          page +
+                          1,
+                        )
+                      }
+                    >
+                      Next
+                    </Link>
+                  ) : (
+                    <span>
+                    Next
+                  </span>
+                  )}
+                </div>
+              )}
+          </>
+        )}
       </s-section>
     </s-page>
   );
 }
 
+/*
+|--------------------------------------------------------------------------
+| SMALL UI COMPONENTS
+|--------------------------------------------------------------------------
+*/
+
+function StatCard({
+                    label,
+                    value,
+                  }) {
+  return (
+    <div
+      style={{
+        padding:
+          "14px",
+
+        border:
+          "1px solid #ddd",
+
+        borderRadius:
+          "8px",
+
+        background:
+          "#fff",
+      }}
+    >
+      <div
+        style={{
+          fontSize:
+            "12px",
+
+          opacity:
+            0.7,
+
+          marginBottom:
+            "6px",
+        }}
+      >
+        {label}
+      </div>
+
+      <strong
+        style={{
+          fontSize:
+            "20px",
+        }}
+      >
+        {value}
+      </strong>
+    </div>
+  );
+}
+
+function FilterLink({
+                      active,
+                      to,
+                      children,
+                    }) {
+  return (
+    <Link
+      to={to}
+      style={{
+        display:
+          "inline-block",
+
+        padding:
+          "8px 12px",
+
+        border:
+          "1px solid #c9cccf",
+
+        borderRadius:
+          "8px",
+
+        textDecoration:
+          "none",
+
+        fontWeight:
+          active
+            ? 700
+            : 400,
+
+        background:
+          active
+            ? "#f1f8f5"
+            : "#fff",
+      }}
+    >
+      {children}
+    </Link>
+  );
+}
+
+const primaryButtonStyle = {
+  padding:
+    "10px 16px",
+
+  fontWeight:
+    600,
+
+  cursor:
+    "pointer",
+};
+
+const secondaryButtonStyle = {
+  padding:
+    "10px 16px",
+
+  cursor:
+    "pointer",
+};
+
 const cellStyle = {
-  padding: "10px",
+  padding:
+    "10px",
+
   borderBottom:
     "1px solid #ddd",
-  textAlign: "left",
-  whiteSpace: "nowrap",
+
+  textAlign:
+    "left",
+
+  whiteSpace:
+    "nowrap",
 };
