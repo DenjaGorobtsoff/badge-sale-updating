@@ -8,7 +8,7 @@ const BADGE_NAMESPACE = "custom";
 const BADGE_KEY = "product_badges";
 
 export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
 
   const response = await admin.graphql(
     `#graphql
@@ -97,8 +97,16 @@ export const loader = async ({ request }) => {
         action = "REMOVE_SALE";
       }
 
+      const variantNumericId =
+        variant.id.split("/").pop();
+
+      const productNumericId =
+        variant.product.id.split("/").pop();
+
       return {
         id: variant.id,
+        variantNumericId,
+        productNumericId,
         productTitle: variant.product.title,
         variantTitle: variant.title,
         sku: variant.sku,
@@ -126,6 +134,9 @@ export const loader = async ({ request }) => {
       (variant) => variant.action === "REMOVE_SALE",
     ).length;
 
+  const storeHandle =
+    session.shop.replace(".myshopify.com", "");
+
   return {
     variants: variantsWithProblems,
     stats: {
@@ -135,6 +146,7 @@ export const loader = async ({ request }) => {
       remove: removeCount,
     },
     pageInfo: json.data.productVariants.pageInfo,
+    storeHandle,
   };
 };
 
@@ -143,6 +155,7 @@ export default function SaleSyncPage() {
     variants,
     stats,
     pageInfo,
+    storeHandle,
   } = useLoaderData();
 
   return (
@@ -214,6 +227,10 @@ export default function SaleSyncPage() {
                 </th>
 
                 <th style={cellStyle}>
+                  Variant ID
+                </th>
+
+                <th style={cellStyle}>
                   SKU
                 </th>
 
@@ -236,6 +253,10 @@ export default function SaleSyncPage() {
                 <th style={cellStyle}>
                   Action
                 </th>
+
+                <th style={cellStyle}>
+                  Admin
+                </th>
               </tr>
               </thead>
 
@@ -248,6 +269,10 @@ export default function SaleSyncPage() {
 
                   <td style={cellStyle}>
                     {variant.variantTitle}
+                  </td>
+
+                  <td style={cellStyle}>
+                    {variant.variantNumericId}
                   </td>
 
                   <td style={cellStyle}>
@@ -278,6 +303,16 @@ export default function SaleSyncPage() {
                     <strong>
                       {variant.action}
                     </strong>
+                  </td>
+
+                  <td style={cellStyle}>
+                    <a
+                      href={`https://admin.shopify.com/store/${storeHandle}/products/${variant.productNumericId}/variants/${variant.variantNumericId}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open
+                    </a>
                   </td>
                 </tr>
               ))}
