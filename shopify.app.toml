@@ -2,7 +2,7 @@
 
 client_id = "5d5b49169d9933803d235b89c608dd3a"
 name = "badge-sale-updating"
-application_url = "https://example.com"
+application_url = "https://badge-sale-updating.vercel.app"
 embedded = true
 
 [access_scopes]
@@ -45,7 +45,7 @@ api_version = "2026-07"
   topics = [ "app/scopes_update" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://badge-sale-updating.vercel.app/auth/callback" ]
 
 [build]
 automatically_update_urls_on_dev = true

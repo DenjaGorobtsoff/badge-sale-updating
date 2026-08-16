@@ -5,6 +5,7 @@ node_modules
 
 /.cache
 /build
+/.vercel
 /app/build
 /public/build/
 /public/_dev
@@ -15,6 +16,7 @@ database.sqlite
 
 .env
 .env.*
+!.env.example
 
 
 
