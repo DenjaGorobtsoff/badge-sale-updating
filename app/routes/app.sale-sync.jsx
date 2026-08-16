@@ -4,6 +4,7 @@ import {
   useLoaderData,
   useNavigation,
 } from "react-router";
+
 import { authenticate } from "../shopify.server";
 
 const SALE_BADGE_GID =
@@ -34,11 +35,15 @@ function analyseVariant(variant) {
     variant.metafield?.value,
   );
 
-  const price = Number(variant.price);
+  const price = Number(
+    variant.price,
+  );
 
   const compareAtPrice =
     variant.compareAtPrice !== null
-      ? Number(variant.compareAtPrice)
+      ? Number(
+        variant.compareAtPrice,
+      )
       : null;
 
   const isOnSale =
@@ -46,15 +51,23 @@ function analyseVariant(variant) {
     compareAtPrice > price;
 
   const hasSaleBadge =
-    badges.includes(SALE_BADGE_GID);
+    badges.includes(
+      SALE_BADGE_GID,
+    );
 
   let action = "NONE";
 
-  if (isOnSale && !hasSaleBadge) {
+  if (
+    isOnSale &&
+    !hasSaleBadge
+  ) {
     action = "ADD_SALE";
   }
 
-  if (!isOnSale && hasSaleBadge) {
+  if (
+    !isOnSale &&
+    hasSaleBadge
+  ) {
     action = "REMOVE_SALE";
   }
 
@@ -68,179 +81,10 @@ function analyseVariant(variant) {
   };
 }
 
-export const loader = async ({ request }) => {
-  const { admin, session } =
-    await authenticate.admin(request);
-
-  const response = await admin.graphql(
-    `#graphql
-      query SaleBadgeDryRun {
-        productVariants(
-          first: 250
-          sortKey: ID
-        ) {
-          nodes {
-            id
-            title
-            sku
-            price
-            compareAtPrice
-
-            product {
-              id
-              title
-            }
-
-            metafield(
-              namespace: "${BADGE_NAMESPACE}"
-              key: "${BADGE_KEY}"
-            ) {
-              id
-              type
-              value
-            }
-          }
-
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-        }
-      }
-    `,
-  );
-
-  const json = await response.json();
-
-  if (json.errors) {
-    console.error(json.errors);
-
-    throw new Response(
-      JSON.stringify(json.errors),
-      { status: 500 },
-    );
-  }
-
-  const allVariants =
-    json.data.productVariants.nodes.map(
-      (variant) => {
-        const analysis =
-          analyseVariant(variant);
-
-        return {
-          id: variant.id,
-
-          variantNumericId:
-            variant.id.split("/").pop(),
-
-          productNumericId:
-            variant.product.id
-              .split("/")
-              .pop(),
-
-          productTitle:
-          variant.product.title,
-
-          variantTitle:
-          variant.title,
-
-          sku:
-          variant.sku,
-
-          price:
-          variant.price,
-
-          compareAtPrice:
-          variant.compareAtPrice,
-
-          badges:
-          analysis.badges,
-
-          isOnSale:
-          analysis.isOnSale,
-
-          hasSaleBadge:
-          analysis.hasSaleBadge,
-
-          action:
-          analysis.action,
-        };
-      },
-    );
-
-  const variants =
-    allVariants.filter(
-      (variant) =>
-        variant.action !== "NONE",
-    );
-
-  return {
-    variants,
-
-    stats: {
-      checked:
-      allVariants.length,
-
-      problems:
-      variants.length,
-
-      add:
-      variants.filter(
-        (variant) =>
-          variant.action ===
-          "ADD_SALE",
-      ).length,
-
-      remove:
-      variants.filter(
-        (variant) =>
-          variant.action ===
-          "REMOVE_SALE",
-      ).length,
-    },
-
-    pageInfo:
-    json.data.productVariants.pageInfo,
-
-    storeHandle:
-      session.shop.replace(
-        ".myshopify.com",
-        "",
-      ),
-  };
-};
-
-export const action = async ({ request }) => {
-  const { admin } =
-    await authenticate.admin(request);
-
-  const formData =
-    await request.formData();
-
-  const variantId =
-    formData.get("variantId");
-
-  if (
-    !variantId ||
-    typeof variantId !== "string" ||
-    !variantId.startsWith(
-      "gid://shopify/ProductVariant/",
-    )
-  ) {
-    return {
-      success: false,
-      message:
-        "Invalid variant ID.",
-    };
-  }
-
-  /*
-   * IMPORTANT:
-   * We re-read the variant here.
-   *
-   * We do NOT trust the data that was
-   * previously displayed by the loader.
-   */
+async function updateSingleVariant(
+  admin,
+  variantId,
+) {
   const response =
     await admin.graphql(
       `#graphql
@@ -281,13 +125,21 @@ export const action = async ({ request }) => {
   const json =
     await response.json();
 
-  if (json.errors) {
-    console.error(json.errors);
+  if (
+    json.errors?.length
+  ) {
+    console.error(
+      "Variant read errors:",
+      json.errors,
+    );
 
     return {
       success: false,
+      skipped: false,
+      variantId,
+      action: null,
       message:
-        "Could not read the variant.",
+        "Could not read variant.",
     };
   }
 
@@ -297,6 +149,9 @@ export const action = async ({ request }) => {
   if (!variant) {
     return {
       success: false,
+      skipped: false,
+      variantId,
+      action: null,
       message:
         "Variant was not found.",
     };
@@ -305,18 +160,27 @@ export const action = async ({ request }) => {
   const analysis =
     analyseVariant(variant);
 
-  if (analysis.action === "NONE") {
+  if (
+    analysis.action ===
+    "NONE"
+  ) {
     return {
       success: true,
+      skipped: true,
+      variantId,
+      action: "NONE",
       message:
-        `${variant.product.title} / ${variant.title}: no update is required.`,
+        `${variant.product.title} / ` +
+        `${variant.title}: ` +
+        `no update required.`,
     };
   }
 
   let nextBadges;
 
   if (
-    analysis.action === "ADD_SALE"
+    analysis.action ===
+    "ADD_SALE"
   ) {
     nextBadges = [
       ...analysis.badges,
@@ -326,16 +190,15 @@ export const action = async ({ request }) => {
     nextBadges =
       analysis.badges.filter(
         (gid) =>
-          gid !== SALE_BADGE_GID,
+          gid !==
+          SALE_BADGE_GID,
       );
   }
 
-  /*
-   * Defensive deduplication.
-   * This does not affect other badges.
-   */
   nextBadges = [
-    ...new Set(nextBadges),
+    ...new Set(
+      nextBadges,
+    ),
   ];
 
   const metafieldInput = {
@@ -352,14 +215,11 @@ export const action = async ({ request }) => {
     BADGE_TYPE,
 
     value:
-      JSON.stringify(nextBadges),
+      JSON.stringify(
+        nextBadges,
+      ),
   };
 
-  /*
-   * If the metafield already exists,
-   * compareDigest prevents us from
-   * overwriting a concurrent change.
-   */
   if (
     variant.metafield
       ?.compareDigest
@@ -377,7 +237,8 @@ export const action = async ({ request }) => {
             [MetafieldsSetInput!]!
         ) {
           metafieldsSet(
-            metafields: $metafields
+            metafields:
+              $metafields
           ) {
             metafields {
               id
@@ -385,6 +246,7 @@ export const action = async ({ request }) => {
               key
               type
               value
+              compareDigest
             }
 
             userErrors {
@@ -407,13 +269,22 @@ export const action = async ({ request }) => {
   const mutationJson =
     await mutationResponse.json();
 
-  if (mutationJson.errors) {
+  if (
+    mutationJson.errors
+      ?.length
+  ) {
     console.error(
+      "Mutation errors:",
       mutationJson.errors,
     );
 
     return {
       success: false,
+      skipped: false,
+      variantId:
+      variant.id,
+      action:
+      analysis.action,
       message:
         "GraphQL mutation failed.",
     };
@@ -424,15 +295,21 @@ export const action = async ({ request }) => {
       .metafieldsSet;
 
   if (
-    result.userErrors?.length
+    result.userErrors
+      ?.length
   ) {
     console.error(
+      "MetafieldsSet errors:",
       result.userErrors,
     );
 
     return {
       success: false,
-
+      skipped: false,
+      variantId:
+      variant.id,
+      action:
+      analysis.action,
       message:
         result.userErrors
           .map(
@@ -445,17 +322,385 @@ export const action = async ({ request }) => {
 
   return {
     success: true,
-
+    skipped: false,
+    variantId:
+    variant.id,
     action:
     analysis.action,
 
-    variantId:
-    variant.id,
-
     message:
-      `${analysis.action} completed for ${variant.product.title} / ${variant.title}.`,
+      `${analysis.action} completed for ` +
+      `${variant.product.title} / ` +
+      `${variant.title}.`,
   };
-};
+}
+
+export const loader =
+  async ({ request }) => {
+    const {
+      admin,
+      session,
+    } =
+      await authenticate.admin(
+        request,
+      );
+
+    const response =
+      await admin.graphql(
+        `#graphql
+          query SaleBadgeDryRun {
+            productVariants(
+              first: 250
+              sortKey: ID
+            ) {
+              nodes {
+                id
+                title
+                sku
+                price
+                compareAtPrice
+
+                product {
+                  id
+                  title
+                }
+
+                metafield(
+                  namespace: "${BADGE_NAMESPACE}"
+                  key: "${BADGE_KEY}"
+                ) {
+                  id
+                  type
+                  value
+                }
+              }
+
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+            }
+          }
+        `,
+      );
+
+    const json =
+      await response.json();
+
+    if (
+      json.errors?.length
+    ) {
+      console.error(
+        "Loader errors:",
+        json.errors,
+      );
+
+      throw new Response(
+        JSON.stringify(
+          json.errors,
+        ),
+        {
+          status: 500,
+        },
+      );
+    }
+
+    const allVariants =
+      json.data
+        .productVariants
+        .nodes
+        .map(
+          (variant) => {
+            const analysis =
+              analyseVariant(
+                variant,
+              );
+
+            return {
+              id:
+              variant.id,
+
+              variantNumericId:
+                variant.id
+                  .split("/")
+                  .pop(),
+
+              productNumericId:
+                variant.product.id
+                  .split("/")
+                  .pop(),
+
+              productTitle:
+              variant.product
+                .title,
+
+              variantTitle:
+              variant.title,
+
+              sku:
+              variant.sku,
+
+              price:
+              variant.price,
+
+              compareAtPrice:
+              variant.compareAtPrice,
+
+              badges:
+              analysis.badges,
+
+              isOnSale:
+              analysis.isOnSale,
+
+              hasSaleBadge:
+              analysis.hasSaleBadge,
+
+              action:
+              analysis.action,
+            };
+          },
+        );
+
+    const variants =
+      allVariants.filter(
+        (variant) =>
+          variant.action !==
+          "NONE",
+      );
+
+    const addCount =
+      variants.filter(
+        (variant) =>
+          variant.action ===
+          "ADD_SALE",
+      ).length;
+
+    const removeCount =
+      variants.filter(
+        (variant) =>
+          variant.action ===
+          "REMOVE_SALE",
+      ).length;
+
+    const storeHandle =
+      session.shop.replace(
+        ".myshopify.com",
+        "",
+      );
+
+    return {
+      variants,
+
+      stats: {
+        checked:
+        allVariants.length,
+
+        problems:
+        variants.length,
+
+        add:
+        addCount,
+
+        remove:
+        removeCount,
+      },
+
+      pageInfo:
+      json.data
+        .productVariants
+        .pageInfo,
+
+      storeHandle,
+    };
+  };
+
+export const action =
+  async ({ request }) => {
+    const { admin } =
+      await authenticate.admin(
+        request,
+      );
+
+    const formData =
+      await request.formData();
+
+    const intent =
+      formData.get(
+        "intent",
+      );
+
+    if (
+      intent === "single"
+    ) {
+      const variantId =
+        formData.get(
+          "variantId",
+        );
+
+      if (
+        !variantId ||
+        typeof variantId !==
+        "string" ||
+        !variantId.startsWith(
+          "gid://shopify/ProductVariant/",
+        )
+      ) {
+        return {
+          success: false,
+          mode: "single",
+
+          message:
+            "Invalid variant ID.",
+        };
+      }
+
+      const result =
+        await updateSingleVariant(
+          admin,
+          variantId,
+        );
+
+      return {
+        success:
+        result.success,
+
+        mode: "single",
+
+        result,
+
+        message:
+        result.message,
+      };
+    }
+
+    if (
+      intent === "batch10"
+    ) {
+      const variantIds =
+        formData
+          .getAll(
+            "variantIds",
+          )
+          .filter(
+            (id) =>
+              typeof id ===
+              "string" &&
+              id.startsWith(
+                "gid://shopify/ProductVariant/",
+              ),
+          )
+          .slice(
+            0,
+            10,
+          );
+
+      if (
+        variantIds.length ===
+        0
+      ) {
+        return {
+          success: false,
+          mode: "batch",
+
+          message:
+            "No variants were selected.",
+        };
+      }
+
+      const results = [];
+
+      for (
+        const variantId
+        of variantIds
+        ) {
+        try {
+          const result =
+            await updateSingleVariant(
+              admin,
+              variantId,
+            );
+
+          results.push(
+            result,
+          );
+        } catch (error) {
+          console.error(
+            "Batch item error:",
+            error,
+          );
+
+          results.push({
+            success: false,
+            skipped: false,
+            variantId,
+            action: null,
+
+            message:
+              error instanceof
+              Error
+                ? error.message
+                : "Unknown error.",
+          });
+        }
+      }
+
+      const updatedCount =
+        results.filter(
+          (item) =>
+            item.success &&
+            !item.skipped,
+        ).length;
+
+      const skippedCount =
+        results.filter(
+          (item) =>
+            item.skipped,
+        ).length;
+
+      const failedCount =
+        results.filter(
+          (item) =>
+            !item.success,
+        ).length;
+
+      return {
+        success:
+          failedCount ===
+          0,
+
+        mode: "batch",
+
+        results,
+
+        stats: {
+          requested:
+          variantIds.length,
+
+          updated:
+          updatedCount,
+
+          skipped:
+          skippedCount,
+
+          failed:
+          failedCount,
+        },
+
+        message:
+          `Batch finished. ` +
+          `Updated: ${updatedCount}, ` +
+          `Skipped: ${skippedCount}, ` +
+          `Failed: ${failedCount}.`,
+      };
+    }
+
+    return {
+      success: false,
+
+      message:
+        "Unknown action.",
+    };
+  };
 
 export default function SaleSyncPage() {
   const {
@@ -463,7 +708,8 @@ export default function SaleSyncPage() {
     stats,
     pageInfo,
     storeHandle,
-  } = useLoaderData();
+  } =
+    useLoaderData();
 
   const actionData =
     useActionData();
@@ -471,140 +717,372 @@ export default function SaleSyncPage() {
   const navigation =
     useNavigation();
 
+  const submittingIntent =
+    navigation.formData?.get(
+      "intent",
+    );
+
   const submittingVariantId =
     navigation.formData?.get(
       "variantId",
     );
 
+  const isBatchSubmitting =
+    navigation.state ===
+    "submitting" &&
+    submittingIntent ===
+    "batch10";
+
   return (
     <s-page heading="SALE badge sync">
-      <s-section heading="Dry run / Single variant test">
+      <s-section heading="Dry run / Controlled update">
         <s-paragraph>
-          Only one variant is changed when
-          you press Apply. No batch update
-          exists on this page yet.
+          The first 250 variants are checked.
+          Only variants with an incorrect SALE badge
+          state are displayed.
+        </s-paragraph>
+
+        <s-paragraph>
+          You can update one variant at a time or apply
+          the first 10 detected problems.
         </s-paragraph>
 
         {actionData?.message && (
           <div
             style={{
               marginTop: "16px",
-              marginBottom: "16px",
-              padding: "12px 16px",
+              marginBottom:
+                "16px",
+              padding:
+                "12px 16px",
+
               border: `1px solid ${
                 actionData.success
                   ? "#008060"
                   : "#d82c0d"
               }`,
-              borderRadius: "8px",
+
+              borderRadius:
+                "8px",
+
+              background:
+                actionData.success
+                  ? "#f1f8f5"
+                  : "#fff4f4",
             }}
           >
             <strong>
               {actionData.success
                 ? "Success"
-                : "Error"}
+                : "Result"}
             </strong>
 
-            <div>
-              {actionData.message}
+            <div
+              style={{
+                marginTop:
+                  "4px",
+              }}
+            >
+              {
+                actionData.message
+              }
             </div>
           </div>
         )}
+
+        {actionData?.mode ===
+          "batch" &&
+          actionData.stats && (
+            <div
+              style={{
+                marginBottom:
+                  "20px",
+
+                padding:
+                  "14px 16px",
+
+                border:
+                  "1px solid #ddd",
+
+                borderRadius:
+                  "8px",
+              }}
+            >
+              <strong>
+                Batch result
+              </strong>
+
+              <div
+                style={{
+                  display:
+                    "flex",
+                  gap: "20px",
+                  flexWrap:
+                    "wrap",
+
+                  marginTop:
+                    "10px",
+                }}
+              >
+                <span>
+                  Requested:{" "}
+                  {
+                    actionData
+                      .stats
+                      .requested
+                  }
+                </span>
+
+                <span>
+                  Updated:{" "}
+                  {
+                    actionData
+                      .stats
+                      .updated
+                  }
+                </span>
+
+                <span>
+                  Skipped:{" "}
+                  {
+                    actionData
+                      .stats
+                      .skipped
+                  }
+                </span>
+
+                <span>
+                  Failed:{" "}
+                  {
+                    actionData
+                      .stats
+                      .failed
+                  }
+                </span>
+              </div>
+            </div>
+          )}
 
         <div
           style={{
             display: "flex",
             gap: "20px",
-            marginTop: "20px",
-            marginBottom: "20px",
+            marginTop:
+              "20px",
+            marginBottom:
+              "20px",
             flexWrap: "wrap",
           }}
         >
           <strong>
-            Checked: {stats.checked}
+            Checked:{" "}
+            {stats.checked}
           </strong>
 
           <strong>
-            Problems: {stats.problems}
+            Problems:{" "}
+            {stats.problems}
           </strong>
 
           <strong>
-            Add SALE: {stats.add}
+            Add SALE:{" "}
+            {stats.add}
           </strong>
 
           <strong>
-            Remove SALE: {stats.remove}
+            Remove SALE:{" "}
+            {stats.remove}
           </strong>
         </div>
 
-        {variants.length === 0 ? (
+        {variants.length >
+          0 && (
+            <Form
+              method="post"
+            >
+              <input
+                type="hidden"
+                name="intent"
+                value="batch10"
+              />
+
+              {variants
+                .slice(
+                  0,
+                  10,
+                )
+                .map(
+                  (
+                    variant,
+                  ) => (
+                    <input
+                      key={
+                        variant.id
+                      }
+                      type="hidden"
+                      name="variantIds"
+                      value={
+                        variant.id
+                      }
+                    />
+                  ),
+                )}
+
+              <button
+                type="submit"
+                disabled={
+                  navigation.state ===
+                  "submitting"
+                }
+                style={{
+                  padding:
+                    "10px 16px",
+
+                  marginBottom:
+                    "20px",
+
+                  fontWeight:
+                    600,
+
+                  cursor:
+                    navigation.state ===
+                    "submitting"
+                      ? "wait"
+                      : "pointer",
+                }}
+              >
+                {isBatchSubmitting
+                  ? "Applying batch..."
+                  : `Apply first ${Math.min(
+                    variants.length,
+                    10,
+                  )} problems`}
+              </button>
+            </Form>
+          )}
+
+        {variants.length ===
+        0 ? (
           <div
             style={{
-              padding: "20px",
-              border: "1px solid #ddd",
-              borderRadius: "8px",
+              padding:
+                "20px",
+
+              border:
+                "1px solid #ddd",
+
+              borderRadius:
+                "8px",
             }}
           >
-            No incorrect SALE badges were
-            found in these variants.
+            No incorrect SALE
+            badges were found
+            in these variants.
           </div>
         ) : (
           <div
             style={{
-              overflowX: "auto",
+              overflowX:
+                "auto",
             }}
           >
             <table
               style={{
-                width: "100%",
+                width:
+                  "100%",
+
                 borderCollapse:
                   "collapse",
               }}
             >
               <thead>
               <tr>
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   Product
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   Variant
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   Variant ID
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   SKU
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   Price
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   Compare at
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   On sale?
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   SALE badge?
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   Action
                 </th>
 
-                <th style={cellStyle}>
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
                   Admin
                 </th>
 
-                <th style={cellStyle}>
-                  Test
+                <th
+                  style={
+                    cellStyle
+                  }
+                >
+                  Update
                 </th>
               </tr>
               </thead>
@@ -612,7 +1090,11 @@ export default function SaleSyncPage() {
               <tbody>
               {variants.map(
                 (variant) => {
-                  const isSubmitting =
+                  const isSingleSubmitting =
+                    navigation.state ===
+                    "submitting" &&
+                    submittingIntent ===
+                    "single" &&
                     submittingVariantId ===
                     variant.id;
 
@@ -736,6 +1218,12 @@ export default function SaleSyncPage() {
                         >
                           <input
                             type="hidden"
+                            name="intent"
+                            value="single"
+                          />
+
+                          <input
+                            type="hidden"
                             name="variantId"
                             value={
                               variant.id
@@ -745,18 +1233,21 @@ export default function SaleSyncPage() {
                           <button
                             type="submit"
                             disabled={
-                              isSubmitting
+                              navigation.state ===
+                              "submitting"
                             }
                             style={{
                               padding:
                                 "8px 14px",
+
                               cursor:
-                                isSubmitting
+                                navigation.state ===
+                                "submitting"
                                   ? "wait"
                                   : "pointer",
                             }}
                           >
-                            {isSubmitting
+                            {isSingleSubmitting
                               ? "Applying..."
                               : "Apply"}
                           </button>
@@ -773,8 +1264,11 @@ export default function SaleSyncPage() {
 
         <div
           style={{
-            marginTop: "20px",
-            fontSize: "13px",
+            marginTop:
+              "20px",
+
+            fontSize:
+              "13px",
           }}
         >
           More variants available:{" "}
