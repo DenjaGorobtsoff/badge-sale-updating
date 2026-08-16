@@ -1,17 +1,19 @@
+import { useEffect, useMemo, useState } from "react";
 import {
-  Link,
   useFetcher,
   useLoaderData,
+  useNavigate,
+  useSearchParams,
 } from "react-router";
 
-import {
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
-
-import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
+import db from "../db.server";
+
+/*
+|--------------------------------------------------------------------------
+| Configuration
+|--------------------------------------------------------------------------
+*/
 
 const SALE_BADGE_GID =
   "gid://shopify/Metaobject/92904096052";
@@ -19,14 +21,15 @@ const SALE_BADGE_GID =
 const BADGE_NAMESPACE = "custom";
 const BADGE_KEY = "product_badges";
 
-const PAGE_SIZE = 250;
-const LIST_PAGE_SIZE = 50;
+const SHOPIFY_PAGE_SIZE = 250;
+const RESULT_PAGE_SIZE = 50;
+const APPLY_BATCH_SIZE = 25;
 
-const VALID_FILTERS = new Set([
-  "ALL",
-  "ADD_SALE",
-  "REMOVE_SALE",
-]);
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
 
 function parseBadges(value) {
   if (!value) {
@@ -37,17 +40,14 @@ function parseBadges(value) {
     const parsed = JSON.parse(value);
 
     return Array.isArray(parsed)
-      ? parsed.filter(
-        (item) =>
-          typeof item === "string",
-      )
+      ? parsed
       : [];
   } catch {
     return [];
   }
 }
 
-function analyseVariant(variant) {
+function getVariantState(variant) {
   const badges = parseBadges(
     variant.metafield?.value,
   );
@@ -57,7 +57,8 @@ function analyseVariant(variant) {
   );
 
   const compareAtPrice =
-    variant.compareAtPrice !== null
+    variant.compareAtPrice !== null &&
+    variant.compareAtPrice !== undefined
       ? Number(
         variant.compareAtPrice,
       )
@@ -85,393 +86,535 @@ function analyseVariant(variant) {
     !isOnSale &&
     hasSaleBadge
   ) {
-    action = "REMOVE_SALE";
+    action =
+      "REMOVE_SALE";
   }
 
   return {
+    badges,
+    price,
+    compareAtPrice,
     isOnSale,
     hasSaleBadge,
     action,
   };
 }
 
-function numericId(gid) {
-  return gid
-    ?.split("/")
-    .pop();
-}
+/*
+|--------------------------------------------------------------------------
+| Loader
+|--------------------------------------------------------------------------
+*/
 
-function normalizePage(value) {
-  const page =
-    Number.parseInt(
-      value || "1",
-      10,
+export async function loader({
+                               request,
+                             }) {
+  const { session } =
+    await authenticate.admin(
+      request,
     );
 
-  return Number.isFinite(page) &&
-  page > 0
-    ? page
-    : 1;
-}
+  const url = new URL(
+    request.url,
+  );
 
-function serializeJob(job) {
+  const page = Math.max(
+    Number(
+      url.searchParams.get(
+        "page",
+      ) || 1,
+    ),
+    1,
+  );
+
+  const skip =
+    (page - 1) *
+    RESULT_PAGE_SIZE;
+
+  const job =
+    await db.saleBadgeSyncJob.findFirst(
+      {
+        where: {
+          shop: session.shop,
+        },
+
+        orderBy: {
+          createdAt:
+            "desc",
+        },
+      },
+    );
+
   if (!job) {
-    return null;
+    return {
+      job: null,
+      items: [],
+      affectedProducts:
+        0,
+      page: 1,
+      totalPages: 0,
+    };
   }
 
+  const [
+    items,
+    affectedProductsRows,
+  ] =
+    await Promise.all([
+      db.saleBadgeSyncItem.findMany(
+        {
+          where: {
+            jobId:
+            job.id,
+          },
+
+          orderBy: [
+            {
+              productTitle:
+                "asc",
+            },
+            {
+              variantTitle:
+                "asc",
+            },
+          ],
+
+          skip,
+
+          take:
+          RESULT_PAGE_SIZE,
+        },
+      ),
+
+      db.saleBadgeSyncItem.findMany(
+        {
+          where: {
+            jobId:
+            job.id,
+          },
+
+          distinct: [
+            "productId",
+          ],
+
+          select: {
+            productId:
+              true,
+          },
+        },
+      ),
+    ]);
+
+  const totalPages =
+    job.changes > 0
+      ? Math.ceil(
+        job.changes /
+        RESULT_PAGE_SIZE,
+      )
+      : 0;
+
   return {
-    id: job.id,
-    shop: job.shop,
-    type: job.type,
-    status: job.status,
-    checked: job.checked,
-    changes: job.changes,
-    addCount: job.addCount,
-    removeCount:
-    job.removeCount,
-    failed: job.failed,
+    job,
+    items,
 
-    startedAt:
-      job.startedAt
-        ?.toISOString?.() ??
-      job.startedAt,
+    affectedProducts:
+    affectedProductsRows.length,
 
-    finishedAt:
-      job.finishedAt
-        ?.toISOString?.() ??
-      job.finishedAt,
-
-    lastError:
-    job.lastError,
+    page,
+    totalPages,
   };
 }
 
 /*
 |--------------------------------------------------------------------------
-| LOADER
+| Action
 |--------------------------------------------------------------------------
-|
-| Reads the latest Dry Run job from PostgreSQL.
-| It does NOT scan Shopify here.
-|
-| It also loads only 50 detected changes at a time.
-|
 */
 
-export const loader =
-  async ({ request }) => {
-    const {
-      session,
-    } =
-      await authenticate.admin(
-        request,
-      );
+export async function action({
+                               request,
+                             }) {
+  const {
+    admin,
+    session,
+  } =
+    await authenticate.admin(
+      request,
+    );
 
-    const url =
-      new URL(request.url);
+  const formData =
+    await request.formData();
 
-    const page =
-      normalizePage(
-        url.searchParams.get(
-          "page",
-        ),
-      );
+  const intent =
+    formData.get(
+      "intent",
+    );
 
-    const requestedFilter =
-      (
-        url.searchParams.get(
-          "filter",
-        ) || "ALL"
-      ).toUpperCase();
+  /*
+  |--------------------------------------------------------------------------
+  | Start Dry Run
+  |--------------------------------------------------------------------------
+  */
 
-    const filter =
-      VALID_FILTERS.has(
-        requestedFilter,
-      )
-        ? requestedFilter
-        : "ALL";
+  if (
+    intent ===
+    "start-dry-run"
+  ) {
+    await db.saleBadgeSyncJob.updateMany(
+      {
+        where: {
+          shop:
+          session.shop,
 
-    /*
-     * Get the latest Dry Run.
-     */
+          status: {
+            in: [
+              "PENDING",
+              "RUNNING",
+            ],
+          },
+        },
+
+        data: {
+          status:
+            "CANCELLED",
+        },
+      },
+    );
+
     const job =
-      await prisma.saleBadgeSyncJob.findFirst(
+      await db.saleBadgeSyncJob.create(
         {
-          where: {
+          data: {
             shop:
             session.shop,
 
-            type:
-              "DRY_RUN",
-          },
+            status:
+              "RUNNING",
 
-          orderBy: {
-            startedAt:
-              "desc",
+            checked:
+              0,
+
+            changes:
+              0,
+
+            addCount:
+              0,
+
+            removeCount:
+              0,
+
+            errors:
+              0,
+
+            cursor:
+              null,
           },
         },
       );
 
-    /*
-     * No Dry Run has been started yet.
-     */
+    return {
+      success: true,
+      type: "dry-run",
+      jobId: job.id,
+      completed:
+        false,
+      message:
+        "Full catalog dry run started.",
+    };
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Scan next Shopify page
+  |--------------------------------------------------------------------------
+  */
+
+  if (
+    intent ===
+    "scan-next-page"
+  ) {
+    const jobId =
+      formData.get(
+        "jobId",
+      );
+
+    const job =
+      await db.saleBadgeSyncJob.findFirst(
+        {
+          where: {
+            id: jobId,
+            shop:
+            session.shop,
+          },
+        },
+      );
+
     if (!job) {
       return {
-        job: null,
-
-        affectedProducts: 0,
-
-        items: [],
-
-        listTotal: 0,
-
-        page: 1,
-
-        totalPages: 0,
-
-        filter,
-
-        storeHandle:
-          session.shop.replace(
-            ".myshopify.com",
-            "",
-          ),
+        success: false,
+        message:
+          "Dry run job not found.",
       };
     }
 
-    const itemWhere = {
-      jobId: job.id,
-
-      ...(filter !== "ALL"
-        ? {
-          action:
-          filter,
-        }
-        : {}),
-    };
-
-    /*
-     * Load:
-     *
-     * 1. Number of detected changes.
-     * 2. Current list page.
-     * 3. Unique products affected.
-     */
-    const [
-      listTotal,
-      items,
-      distinctProducts,
-    ] =
-      await prisma.$transaction(
-        [
-          prisma.saleBadgeSyncItem.count(
-            {
-              where:
-              itemWhere,
-            },
-          ),
-
-          prisma.saleBadgeSyncItem.findMany(
-            {
-              where:
-              itemWhere,
-
-              orderBy: [
-                {
-                  productTitle:
-                    "asc",
-                },
-
-                {
-                  variantTitle:
-                    "asc",
-                },
-              ],
-
-              skip:
-                (page - 1) *
-                LIST_PAGE_SIZE,
-
-              take:
-              LIST_PAGE_SIZE,
-            },
-          ),
-
-          prisma.saleBadgeSyncItem.findMany(
-            {
-              where: {
-                jobId:
-                job.id,
-              },
-
-              distinct: [
-                "productId",
-              ],
-
-              select: {
-                productId:
-                  true,
-              },
-            },
-          ),
-        ],
-      );
-
-    const totalPages =
-      Math.ceil(
-        listTotal /
-        LIST_PAGE_SIZE,
-      );
-
-    return {
-      job:
-        serializeJob(job),
-
-      /*
-       * Number of UNIQUE products
-       * that contain at least one
-       * problematic variant.
-       */
-      affectedProducts:
-      distinctProducts.length,
-
-      items:
-        items.map(
-          (item) => ({
-            ...item,
-
-            createdAt:
-              item.createdAt.toISOString(),
-
-            variantNumericId:
-              numericId(
-                item.variantId,
-              ),
-
-            productNumericId:
-              numericId(
-                item.productId,
-              ),
-          }),
-        ),
-
-      listTotal,
-
-      page,
-
-      totalPages,
-
-      filter,
-
-      storeHandle:
-        session.shop.replace(
-          ".myshopify.com",
-          "",
-        ),
-    };
-  };
-
-/*
-|--------------------------------------------------------------------------
-| ACTION
-|--------------------------------------------------------------------------
-|
-| Handles:
-|
-| startDryRun
-| processDryRun
-|
-*/
-
-export const action =
-  async ({ request }) => {
-    const {
-      admin,
-      session,
-    } =
-      await authenticate.admin(
-        request,
-      );
-
-    const formData =
-      await request.formData();
-
-    const intent =
-      formData.get(
-        "intent",
-      );
-
-    /*
-    |--------------------------------------------------------------------------
-    | START FULL DRY RUN
-    |--------------------------------------------------------------------------
-    */
-
     if (
-      intent ===
-      "startDryRun"
+      job.status ===
+      "COMPLETED"
     ) {
-      /*
-       * Prevent two Dry Runs from
-       * running simultaneously.
-       */
-      const runningJob =
-        await prisma.saleBadgeSyncJob.findFirst(
+      return {
+        success: true,
+        type: "dry-run",
+        jobId:
+        job.id,
+        completed:
+          true,
+        message:
+          "Full catalog dry run already completed.",
+      };
+    }
+
+    try {
+      const response =
+        await admin.graphql(
+          `#graphql
+            query SaleBadgeFullDryRun(
+              $first: Int!
+              $after: String
+            ) {
+              productVariants(
+                first: $first
+                after: $after
+                sortKey: ID
+              ) {
+                nodes {
+                  id
+                  title
+                  sku
+                  price
+                  compareAtPrice
+
+                  product {
+                    id
+                    title
+                  }
+
+                  metafield(
+                    namespace: "${BADGE_NAMESPACE}"
+                    key: "${BADGE_KEY}"
+                  ) {
+                    id
+                    type
+                    value
+                  }
+                }
+
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+              }
+            }
+          `,
+
           {
-            where: {
-              shop:
-              session.shop,
+            variables: {
+              first:
+              SHOPIFY_PAGE_SIZE,
 
-              type:
-                "DRY_RUN",
-
-              status:
-                "RUNNING",
-            },
-
-            orderBy: {
-              startedAt:
-                "desc",
+              after:
+                job.cursor ||
+                null,
             },
           },
         );
 
-      /*
-       * If a previous scan is still
-       * running, return it instead
-       * of creating another one.
-       */
-      if (runningJob) {
-        return {
-          success: true,
+      const json =
+        await response.json();
 
-          intent,
+      if (
+        json.errors
+      ) {
+        console.error(
+          json.errors,
+        );
+
+        await db.saleBadgeSyncJob.update(
+          {
+            where: {
+              id: job.id,
+            },
+
+            data: {
+              status:
+                "FAILED",
+
+              errors: {
+                increment:
+                  1,
+              },
+            },
+          },
+        );
+
+        return {
+          success:
+            false,
 
           message:
-            "A dry run is already in progress. Resuming it.",
-
-          job:
-            serializeJob(
-              runningJob,
-            ),
+            "Shopify GraphQL returned an error.",
         };
       }
 
-      /*
-       * Create new Dry Run.
-       */
-      const job =
-        await prisma.saleBadgeSyncJob.create(
-          {
-            data: {
-              shop:
-              session.shop,
+      const connection =
+        json.data
+          .productVariants;
 
-              type:
-                "DRY_RUN",
+      const variants =
+        connection.nodes;
+
+      let addCount = 0;
+      let removeCount = 0;
+
+      const problemItems =
+        [];
+
+      for (
+        const variant
+        of variants
+        ) {
+        const state =
+          getVariantState(
+            variant,
+          );
+
+        if (
+          state.action ===
+          "NONE"
+        ) {
+          continue;
+        }
+
+        if (
+          state.action ===
+          "ADD_SALE"
+        ) {
+          addCount += 1;
+        }
+
+        if (
+          state.action ===
+          "REMOVE_SALE"
+        ) {
+          removeCount += 1;
+        }
+
+        problemItems.push(
+          {
+            jobId:
+            job.id,
+
+            variantId:
+            variant.id,
+
+            productId:
+            variant.product
+              .id,
+
+            productTitle:
+            variant.product
+              .title,
+
+            variantTitle:
+            variant.title,
+
+            sku:
+              variant.sku ||
+              null,
+
+            price:
+              String(
+                variant.price,
+              ),
+
+            compareAtPrice:
+              variant.compareAtPrice !==
+              null &&
+              variant.compareAtPrice !==
+              undefined
+                ? String(
+                  variant.compareAtPrice,
+                )
+                : null,
+
+            action:
+            state.action,
+
+            isOnSale:
+            state.isOnSale,
+
+            hasSaleBadge:
+            state.hasSaleBadge,
+          },
+        );
+      }
+
+      if (
+        problemItems.length >
+        0
+      ) {
+        await db.saleBadgeSyncItem.createMany(
+          {
+            data:
+            problemItems,
+
+            skipDuplicates:
+              true,
+          },
+        );
+      }
+
+      const hasNextPage =
+        connection.pageInfo
+          .hasNextPage;
+
+      const updatedJob =
+        await db.saleBadgeSyncJob.update(
+          {
+            where: {
+              id: job.id,
+            },
+
+            data: {
+              checked: {
+                increment:
+                variants.length,
+              },
+
+              changes: {
+                increment:
+                problemItems.length,
+              },
+
+              addCount: {
+                increment:
+                addCount,
+              },
+
+              removeCount:
+                {
+                  increment:
+                  removeCount,
+                },
+
+              cursor:
+              connection
+                .pageInfo
+                .endCursor,
 
               status:
-                "RUNNING",
+                hasNextPage
+                  ? "RUNNING"
+                  : "COMPLETED",
             },
           },
         );
@@ -479,159 +622,249 @@ export const action =
       return {
         success: true,
 
-        intent,
+        type:
+          "dry-run",
+
+        jobId:
+        updatedJob.id,
+
+        completed:
+          !hasNextPage,
+
+        checked:
+        updatedJob.checked,
+
+        changes:
+        updatedJob.changes,
+
+        addCount:
+        updatedJob.addCount,
+
+        removeCount:
+        updatedJob.removeCount,
 
         message:
-          "Full catalog dry run started.",
+          hasNextPage
+            ? `Checked ${updatedJob.checked} variants...`
+            : "Full catalog dry run completed.",
+      };
+    } catch (
+      error
+      ) {
+      console.error(
+        "Dry run error:",
+        error,
+      );
 
-        job:
-          serializeJob(job),
+      await db.saleBadgeSyncJob.update(
+        {
+          where: {
+            id: job.id,
+          },
+
+          data: {
+            status:
+              "FAILED",
+
+            errors: {
+              increment:
+                1,
+            },
+          },
+        },
+      );
+
+      return {
+        success:
+          false,
+
+        message:
+          error instanceof
+          Error
+            ? error.message
+            : "Unknown dry run error.",
+      };
+    }
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Apply next batch
+  |--------------------------------------------------------------------------
+  */
+
+  if (
+    intent ===
+    "apply-next-batch"
+  ) {
+    const jobId =
+      formData.get(
+        "jobId",
+      );
+
+    const offset =
+      Math.max(
+        Number(
+          formData.get(
+            "offset",
+          ) || 0,
+        ),
+        0,
+      );
+
+    const job =
+      await db.saleBadgeSyncJob.findFirst(
+        {
+          where: {
+            id: jobId,
+
+            shop:
+            session.shop,
+
+            status:
+              "COMPLETED",
+          },
+        },
+      );
+
+    if (!job) {
+      return {
+        success:
+          false,
+
+        message:
+          "A completed dry run is required before applying changes.",
       };
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | PROCESS ONE SHOPIFY PAGE
-    |--------------------------------------------------------------------------
-    |
-    | One request = maximum 250 variants.
-    |
-    | This is intentional.
-    |
-    | We do NOT attempt to process
-    | 50,000 variants in one Vercel request.
-    |
-    */
+    if (
+      job.changes <=
+      0
+    ) {
+      return {
+        success:
+          false,
+
+        message:
+          "There are no SALE badge changes to apply.",
+      };
+    }
+
+    const items =
+      await db.saleBadgeSyncItem.findMany(
+        {
+          where: {
+            jobId:
+            job.id,
+          },
+
+          orderBy: {
+            createdAt:
+              "asc",
+          },
+
+          skip:
+          offset,
+
+          take:
+          APPLY_BATCH_SIZE,
+        },
+      );
 
     if (
-      intent ===
-      "processDryRun"
+      items.length ===
+      0
     ) {
-      const jobId =
-        formData.get(
-          "jobId",
-        );
+      return {
+        success: true,
 
-      if (
-        !jobId ||
-        typeof jobId !==
-        "string"
+        type:
+          "apply",
+
+        completed:
+          true,
+
+        nextOffset:
+        offset,
+
+        processed:
+        offset,
+
+        total:
+        job.changes,
+
+        updated:
+          0,
+
+        added:
+          0,
+
+        removed:
+          0,
+
+        skipped:
+          0,
+
+        failed:
+          0,
+
+        message:
+          "All SALE badge changes have been processed.",
+      };
+    }
+
+    let updated = 0;
+    let added = 0;
+    let removed = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    /*
+    |--------------------------------------------------------------------------
+    | Process each variant
+    |--------------------------------------------------------------------------
+    */
+
+    for (
+      const item
+      of items
       ) {
-        return {
-          success: false,
-
-          intent,
-
-          message:
-            "Missing dry run job ID.",
-        };
-      }
-
-      /*
-       * Make sure this job belongs
-       * to the current Shopify store.
-       */
-      const job =
-        await prisma.saleBadgeSyncJob.findFirst(
-          {
-            where: {
-              id: jobId,
-
-              shop:
-              session.shop,
-
-              type:
-                "DRY_RUN",
-            },
-          },
-        );
-
-      if (!job) {
-        return {
-          success: false,
-
-          intent,
-
-          message:
-            "Dry run job was not found.",
-        };
-      }
-
-      /*
-       * Don't continue finished jobs.
-       */
-      if (
-        job.status !==
-        "RUNNING"
-      ) {
-        return {
-          success:
-            job.status ===
-            "COMPLETED",
-
-          intent,
-
-          message:
-            `Dry run is ${job.status.toLowerCase()}.`,
-
-          job:
-            serializeJob(job),
-        };
-      }
-
       try {
         /*
-         * Read next 250 variants.
-         */
+        |--------------------------------------------------------------------------
+        | Re-read current variant state
+        |--------------------------------------------------------------------------
+        */
+
         const response =
           await admin.graphql(
             `#graphql
-              query FullSaleBadgeDryRun(
-                $first: Int!
-                $after: String
+              query CurrentVariantState(
+                $id: ID!
               ) {
-                productVariants(
-                  first: $first
-                  after: $after
-                  sortKey: ID
+                productVariant(
+                  id: $id
                 ) {
-                  nodes {
+                  id
+                  price
+                  compareAtPrice
+
+                  metafield(
+                    namespace: "${BADGE_NAMESPACE}"
+                    key: "${BADGE_KEY}"
+                  ) {
                     id
-                    title
-                    sku
-                    price
-                    compareAtPrice
-
-                    product {
-                      id
-                      title
-                    }
-
-                    metafield(
-                      namespace: "${BADGE_NAMESPACE}"
-                      key: "${BADGE_KEY}"
-                    ) {
-                      id
-                      type
-                      value
-                    }
-                  }
-
-                  pageInfo {
-                    hasNextPage
-                    endCursor
+                    type
+                    value
                   }
                 }
               }
             `,
+
             {
               variables: {
-                first:
-                PAGE_SIZE,
-
-                after:
-                  job.cursor ||
-                  null,
+                id:
+                item.variantId,
               },
             },
           );
@@ -639,846 +872,1147 @@ export const action =
         const json =
           await response.json();
 
-        /*
-         * Shopify GraphQL errors.
-         */
         if (
-          json.errors?.length
+          json.errors
         ) {
-          throw new Error(
-            json.errors
-              .map(
-                (error) =>
-                  error.message,
-              )
-              .join("; "),
+          console.error(
+            json.errors,
           );
+
+          failed += 1;
+          continue;
         }
 
-        const connection =
+        const variant =
           json.data
-            ?.productVariants;
+            .productVariant;
 
-        if (!connection) {
-          throw new Error(
-            "Shopify response did not contain productVariants.",
-          );
+        if (
+          !variant
+        ) {
+          skipped += 1;
+          continue;
         }
 
-        let addCount = 0;
-        let removeCount = 0;
+        const state =
+          getVariantState(
+            variant,
+          );
 
-        const problemItems =
+        /*
+        |--------------------------------------------------------------------------
+        | Already correct
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+          state.action ===
+          "NONE"
+        ) {
+          skipped += 1;
+          continue;
+        }
+
+        let nextBadges = [
+          ...state.badges,
+        ];
+
+        /*
+        |--------------------------------------------------------------------------
+        | ADD SALE
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+          state.action ===
+          "ADD_SALE"
+        ) {
+          if (
+            !nextBadges.includes(
+              SALE_BADGE_GID,
+            )
+          ) {
+            nextBadges.push(
+              SALE_BADGE_GID,
+            );
+          }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | REMOVE SALE
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+          state.action ===
+          "REMOVE_SALE"
+        ) {
+          nextBadges =
+            nextBadges.filter(
+              (badge) =>
+                badge !==
+                SALE_BADGE_GID,
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Update metafield
+        |--------------------------------------------------------------------------
+        */
+
+        const mutationResponse =
+          await admin.graphql(
+            `#graphql
+              mutation UpdateSaleBadge(
+                $metafields: [MetafieldsSetInput!]!
+              ) {
+                metafieldsSet(
+                  metafields: $metafields
+                ) {
+                  metafields {
+                    id
+                    namespace
+                    key
+                    value
+                  }
+
+                  userErrors {
+                    field
+                    message
+                    code
+                  }
+                }
+              }
+            `,
+
+            {
+              variables: {
+                metafields: [
+                  {
+                    ownerId:
+                    item.variantId,
+
+                    namespace:
+                    BADGE_NAMESPACE,
+
+                    key:
+                    BADGE_KEY,
+
+                    type:
+                      "list.metaobject_reference",
+
+                    value:
+                      JSON.stringify(
+                        nextBadges,
+                      ),
+                  },
+                ],
+              },
+            },
+          );
+
+        const mutationJson =
+          await mutationResponse.json();
+
+        if (
+          mutationJson.errors
+        ) {
+          console.error(
+            mutationJson.errors,
+          );
+
+          failed += 1;
+          continue;
+        }
+
+        const userErrors =
+          mutationJson.data
+            ?.metafieldsSet
+            ?.userErrors ||
           [];
 
-        /*
-         * Analyse every variant.
-         */
-        for (
-          const variant
-          of connection.nodes
-          ) {
-          const analysis =
-            analyseVariant(
-              variant,
-            );
-
-          /*
-           * Correct state.
-           *
-           * We don't need to save
-           * this variant in DB.
-           */
-          if (
-            analysis.action ===
-            "NONE"
-          ) {
-            continue;
-          }
-
-          if (
-            analysis.action ===
-            "ADD_SALE"
-          ) {
-            addCount += 1;
-          }
-
-          if (
-            analysis.action ===
-            "REMOVE_SALE"
-          ) {
-            removeCount += 1;
-          }
-
-          /*
-           * Save only problematic variants.
-           */
-          problemItems.push(
-            {
-              jobId:
-              job.id,
-
-              variantId:
-              variant.id,
-
-              productId:
-              variant.product.id,
-
-              productTitle:
-              variant.product.title,
-
-              variantTitle:
-              variant.title,
-
-              sku:
-                variant.sku ||
-                null,
-
-              price:
-                String(
-                  variant.price,
-                ),
-
-              compareAtPrice:
-                variant.compareAtPrice !==
-                null
-                  ? String(
-                    variant.compareAtPrice,
-                  )
-                  : null,
-
-              action:
-              analysis.action,
-
-              isOnSale:
-              analysis.isOnSale,
-
-              hasSaleBadge:
-              analysis.hasSaleBadge,
-            },
+        if (
+          userErrors.length >
+          0
+        ) {
+          console.error(
+            "metafieldsSet userErrors:",
+            userErrors,
           );
+
+          failed += 1;
+          continue;
         }
 
-        const pageChecked =
-          connection.nodes.length;
+        updated += 1;
 
-        const pageChanges =
-          problemItems.length;
+        if (
+          state.action ===
+          "ADD_SALE"
+        ) {
+          added += 1;
+        }
 
-        const completed =
-          !connection.pageInfo
-            .hasNextPage;
-
-        /*
-         * Save:
-         *
-         * - problem variants
-         * - new cursor
-         * - statistics
-         *
-         * inside one DB transaction.
-         */
-        const updatedJob =
-          await prisma.$transaction(
-            async (tx) => {
-              if (
-                problemItems.length >
-                0
-              ) {
-                await tx.saleBadgeSyncItem.createMany(
-                  {
-                    data:
-                    problemItems,
-
-                    /*
-                     * Prevent duplicates
-                     * if the same page is
-                     * accidentally processed
-                     * twice.
-                     */
-                    skipDuplicates:
-                      true,
-                  },
-                );
-              }
-
-              return tx.saleBadgeSyncJob.update(
-                {
-                  where: {
-                    id:
-                    job.id,
-                  },
-
-                  data: {
-                    cursor:
-                      connection
-                        .pageInfo
-                        .endCursor ||
-                      job.cursor,
-
-                    checked: {
-                      increment:
-                      pageChecked,
-                    },
-
-                    changes: {
-                      increment:
-                      pageChanges,
-                    },
-
-                    addCount: {
-                      increment:
-                      addCount,
-                    },
-
-                    removeCount: {
-                      increment:
-                      removeCount,
-                    },
-
-                    status:
-                      completed
-                        ? "COMPLETED"
-                        : "RUNNING",
-
-                    finishedAt:
-                      completed
-                        ? new Date()
-                        : null,
-
-                    lastError:
-                      null,
-                  },
-                },
-              );
-            },
-          );
-
-        return {
-          success: true,
-
-          intent,
-
-          message:
-            completed
-              ? "Full catalog dry run completed."
-              : `Checked another ${pageChecked} variants.`,
-
-          job:
-            serializeJob(
-              updatedJob,
-            ),
-
-          page: {
-            checked:
-            pageChecked,
-
-            changes:
-            pageChanges,
-
-            add:
-            addCount,
-
-            remove:
-            removeCount,
-
-            hasNextPage:
-            connection
-              .pageInfo
-              .hasNextPage,
-          },
-        };
-      } catch (error) {
+        if (
+          state.action ===
+          "REMOVE_SALE"
+        ) {
+          removed += 1;
+        }
+      } catch (
+        error
+        ) {
         console.error(
-          "Full dry run error:",
+          `Failed to update ${item.variantId}:`,
           error,
         );
 
-        const message =
-          error instanceof
-          Error
-            ? error.message
-            : "Unknown dry run error.";
-
-        /*
-         * Store the failure in DB.
-         */
-        const failedJob =
-          await prisma.saleBadgeSyncJob.update(
-            {
-              where: {
-                id:
-                job.id,
-              },
-
-              data: {
-                status:
-                  "FAILED",
-
-                failed: {
-                  increment:
-                    1,
-                },
-
-                lastError:
-                message,
-
-                finishedAt:
-                  new Date(),
-              },
-            },
-          );
-
-        return {
-          success: false,
-
-          intent,
-
-          message,
-
-          job:
-            serializeJob(
-              failedJob,
-            ),
-        };
+        failed += 1;
       }
     }
 
-    return {
-      success: false,
+    const nextOffset =
+      offset +
+      items.length;
 
-      intent,
+    const completed =
+      nextOffset >=
+      job.changes;
+
+    return {
+      success: true,
+
+      type:
+        "apply",
+
+      completed,
+
+      nextOffset,
+
+      processed:
+      nextOffset,
+
+      total:
+      job.changes,
+
+      updated,
+
+      added,
+
+      removed,
+
+      skipped,
+
+      failed,
 
       message:
-        "Unknown action.",
+        completed
+          ? "All SALE badge changes have been processed."
+          : `Processed ${nextOffset} of ${job.changes} variants.`,
     };
+  }
+
+  return {
+    success: false,
+    message:
+      "Unknown action.",
   };
+}
 
 /*
 |--------------------------------------------------------------------------
-| PAGE
+| Page
 |--------------------------------------------------------------------------
 */
 
 export default function SaleSyncPage() {
   const {
     job,
-    affectedProducts,
     items,
-    listTotal,
+    affectedProducts,
     page,
     totalPages,
-    filter,
-    storeHandle,
   } =
     useLoaderData();
 
-  const scanFetcher =
+  const dryRunFetcher =
     useFetcher();
 
+  const applyFetcher =
+    useFetcher();
+
+  const navigate =
+    useNavigate();
+
+  const [searchParams] =
+    useSearchParams();
+
+  /*
+  |--------------------------------------------------------------------------
+  | Dry run state
+  |--------------------------------------------------------------------------
+  */
+
   const [
-    autoRunning,
-    setAutoRunning,
+    autoScanning,
+    setAutoScanning,
+  ] =
+    useState(
+      job?.status ===
+      "RUNNING",
+    );
+
+  const [
+    currentJobId,
+    setCurrentJobId,
+  ] =
+    useState(
+      job?.id ||
+      null,
+    );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Apply state
+  |--------------------------------------------------------------------------
+  */
+
+  const [
+    autoApplying,
+    setAutoApplying,
   ] =
     useState(false);
 
-  /*
-   * Prefer the newest job state returned
-   * by useFetcher over the loader state.
-   */
-  const liveJob =
-    scanFetcher.data
-      ?.job ||
-    job;
-
-  const isSubmitting =
-    scanFetcher.state !==
-    "idle";
-
-  const progressMessage =
-    scanFetcher.data
-      ?.message;
+  const [
+    applyProgress,
+    setApplyProgress,
+  ] =
+    useState(null);
 
   /*
   |--------------------------------------------------------------------------
-  | AUTOMATIC PAGE PROCESSING
+  | Can apply?
   |--------------------------------------------------------------------------
   |
-  | Browser sends:
+  | IMPORTANT:
+  | Update all products is active ONLY when:
   |
-  | processDryRun
-  |       ↓
-  | 250 variants
-  |       ↓
-  | response
-  |       ↓
-  | processDryRun
-  |       ↓
-  | next 250
+  | 1. Dry run exists
+  | 2. Dry run status = COMPLETED
+  | 3. There are variants to change
   |
   */
 
-  useEffect(() => {
-    if (!autoRunning) {
-      return;
-    }
+  const canApply =
+    job?.status ===
+    "COMPLETED" &&
+    job?.changes > 0;
 
-    /*
-     * Wait until previous request
-     * has finished.
-     */
+  /*
+  |--------------------------------------------------------------------------
+  | Start Dry Run
+  |--------------------------------------------------------------------------
+  */
+
+  function startDryRun() {
     if (
-      scanFetcher.state !==
+      dryRunFetcher.state !==
       "idle"
     ) {
       return;
     }
 
     /*
-     * Stop automatically when job
-     * is completed or failed.
+     * Reset any previous apply progress.
      */
+
+    setAutoApplying(
+      false,
+    );
+
+    setApplyProgress(
+      null,
+    );
+
+    const formData =
+      new FormData();
+
+    formData.set(
+      "intent",
+      "start-dry-run",
+    );
+
+    dryRunFetcher.submit(
+      formData,
+      {
+        method:
+          "post",
+      },
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Continue Dry Run
+  |--------------------------------------------------------------------------
+  */
+
+  function scanNextPage(
+    jobId,
+  ) {
     if (
-      !liveJob ||
-      liveJob.status !==
-      "RUNNING"
+      !jobId ||
+      dryRunFetcher.state !==
+      "idle"
     ) {
-      setAutoRunning(
+      return;
+    }
+
+    const formData =
+      new FormData();
+
+    formData.set(
+      "intent",
+      "scan-next-page",
+    );
+
+    formData.set(
+      "jobId",
+      jobId,
+    );
+
+    dryRunFetcher.submit(
+      formData,
+      {
+        method:
+          "post",
+      },
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Handle Dry Run responses
+  |--------------------------------------------------------------------------
+  */
+
+  useEffect(() => {
+    const data =
+      dryRunFetcher.data;
+
+    if (
+      !data
+    ) {
+      return;
+    }
+
+    if (
+      data.success ===
+      false
+    ) {
+      setAutoScanning(
         false,
       );
 
       return;
     }
 
-    /*
-     * Small pause between Shopify requests.
-     */
-    const timer =
-      window.setTimeout(
-        () => {
-          scanFetcher.submit(
-            {
-              intent:
-                "processDryRun",
+    if (
+      data.type !==
+      "dry-run"
+    ) {
+      return;
+    }
 
-              jobId:
-              liveJob.id,
-            },
-            {
-              method:
-                "post",
-            },
+    if (
+      data.jobId
+    ) {
+      setCurrentJobId(
+        data.jobId,
+      );
+    }
+
+    if (
+      data.completed
+    ) {
+      setAutoScanning(
+        false,
+      );
+
+      /*
+       * Reload loader data so that the completed
+       * job and its result list are displayed.
+       */
+
+      navigate(
+        "/app/sale-sync",
+        {
+          replace:
+            true,
+        },
+      );
+
+      return;
+    }
+
+    setAutoScanning(
+      true,
+    );
+  }, [
+    dryRunFetcher.data,
+    navigate,
+  ]);
+
+  /*
+  |--------------------------------------------------------------------------
+  | Automatic Dry Run pagination
+  |--------------------------------------------------------------------------
+  */
+
+  useEffect(() => {
+    if (
+      !autoScanning
+    ) {
+      return;
+    }
+
+    if (
+      !currentJobId
+    ) {
+      return;
+    }
+
+    if (
+      dryRunFetcher.state !==
+      "idle"
+    ) {
+      return;
+    }
+
+    const timer =
+      setTimeout(
+        () => {
+          scanNextPage(
+            currentJobId,
           );
         },
-        250,
+        150,
       );
 
     return () =>
-      window.clearTimeout(
+      clearTimeout(
         timer,
       );
   }, [
-    autoRunning,
-    liveJob,
-    scanFetcher,
-    scanFetcher.state,
+    autoScanning,
+    currentJobId,
+    dryRunFetcher.state,
+    dryRunFetcher.data,
   ]);
 
-  const status =
-    liveJob?.status ||
-    "NOT_STARTED";
+  /*
+  |--------------------------------------------------------------------------
+  | Start Apply
+  |--------------------------------------------------------------------------
+  */
 
-  const canStart =
-    !liveJob ||
-    [
-      "COMPLETED",
-      "FAILED",
-    ].includes(
-      liveJob.status,
+  function startApply() {
+    /*
+     * Extra client-side safety check.
+     */
+
+    if (
+      !canApply
+    ) {
+      return;
+    }
+
+    if (
+      applyFetcher.state !==
+      "idle"
+    ) {
+      return;
+    }
+
+    setApplyProgress(
+      {
+        processed:
+          0,
+
+        total:
+        job.changes,
+
+        updated:
+          0,
+
+        added:
+          0,
+
+        removed:
+          0,
+
+        skipped:
+          0,
+
+        failed:
+          0,
+
+        completed:
+          false,
+
+        halted:
+          false,
+
+        nextOffset:
+          0,
+      },
     );
 
-  const canResume =
-    liveJob?.status ===
-    "RUNNING";
+    setAutoApplying(
+      true,
+    );
+  }
 
   /*
-   * "Showing 1-50 of 3421"
-   */
-  const shownRange =
+  |--------------------------------------------------------------------------
+  | Submit next apply batch
+  |--------------------------------------------------------------------------
+  */
+
+  function applyNextBatch(
+    offset,
+  ) {
+    if (
+      !job?.id
+    ) {
+      return;
+    }
+
+    if (
+      applyFetcher.state !==
+      "idle"
+    ) {
+      return;
+    }
+
+    const formData =
+      new FormData();
+
+    formData.set(
+      "intent",
+      "apply-next-batch",
+    );
+
+    formData.set(
+      "jobId",
+      job.id,
+    );
+
+    formData.set(
+      "offset",
+      String(offset),
+    );
+
+    applyFetcher.submit(
+      formData,
+      {
+        method:
+          "post",
+      },
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Automatic apply batches
+  |--------------------------------------------------------------------------
+  */
+
+  useEffect(() => {
+    if (
+      !autoApplying
+    ) {
+      return;
+    }
+
+    if (
+      !applyProgress
+    ) {
+      return;
+    }
+
+    if (
+      applyProgress.completed
+    ) {
+      return;
+    }
+
+    if (
+      applyFetcher.state !==
+      "idle"
+    ) {
+      return;
+    }
+
+    const timer =
+      setTimeout(
+        () => {
+          applyNextBatch(
+            applyProgress.nextOffset ||
+            0,
+          );
+        },
+        200,
+      );
+
+    return () =>
+      clearTimeout(
+        timer,
+      );
+  }, [
+    autoApplying,
+    applyProgress,
+    applyFetcher.state,
+  ]);
+
+  /*
+  |--------------------------------------------------------------------------
+  | Handle Apply response
+  |--------------------------------------------------------------------------
+  */
+
+  useEffect(() => {
+    const data =
+      applyFetcher.data;
+
+    if (
+      !data ||
+      data.type !==
+      "apply"
+    ) {
+      return;
+    }
+
+    if (
+      data.success ===
+      false
+    ) {
+      setAutoApplying(
+        false,
+      );
+
+      setApplyProgress(
+        (previous) => ({
+          ...(previous ||
+            {}),
+
+          halted:
+            true,
+        }),
+      );
+
+      return;
+    }
+
+    setApplyProgress(
+      (previous) => {
+        const prev =
+          previous || {
+            processed:
+              0,
+
+            total:
+              data.total ||
+              0,
+
+            updated:
+              0,
+
+            added:
+              0,
+
+            removed:
+              0,
+
+            skipped:
+              0,
+
+            failed:
+              0,
+          };
+
+        return {
+          processed:
+          data.processed,
+
+          total:
+          data.total,
+
+          updated:
+            prev.updated +
+            (data.updated ||
+              0),
+
+          added:
+            prev.added +
+            (data.added ||
+              0),
+
+          removed:
+            prev.removed +
+            (data.removed ||
+              0),
+
+          skipped:
+            prev.skipped +
+            (data.skipped ||
+              0),
+
+          failed:
+            prev.failed +
+            (data.failed ||
+              0),
+
+          nextOffset:
+          data.nextOffset,
+
+          completed:
+            Boolean(
+              data.completed,
+            ),
+
+          halted:
+            false,
+        };
+      },
+    );
+
+    if (
+      data.completed
+    ) {
+      setAutoApplying(
+        false,
+      );
+    }
+  }, [
+    applyFetcher.data,
+  ]);
+
+  /*
+  |--------------------------------------------------------------------------
+  | Resume apply
+  |--------------------------------------------------------------------------
+  */
+
+  function resumeApply() {
+    if (
+      !applyProgress ||
+      applyProgress.completed
+    ) {
+      return;
+    }
+
+    setApplyProgress(
+      (previous) => ({
+        ...previous,
+        halted:
+          false,
+      }),
+    );
+
+    setAutoApplying(
+      true,
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Status helpers
+  |--------------------------------------------------------------------------
+  */
+
+  const isDryRunBusy =
+    dryRunFetcher.state !==
+    "idle" ||
+    autoScanning;
+
+  const isApplyBusy =
+    applyFetcher.state !==
+    "idle" ||
+    autoApplying;
+
+  const dryRunMessage =
+    dryRunFetcher.data
+      ?.message;
+
+  const applyMessage =
+    applyFetcher.data
+      ?.message;
+
+  const currentChecked =
+    dryRunFetcher.data
+      ?.checked ??
+    job?.checked ??
+    0;
+
+  const currentChanges =
+    dryRunFetcher.data
+      ?.changes ??
+    job?.changes ??
+    0;
+
+  const currentAdd =
+    dryRunFetcher.data
+      ?.addCount ??
+    job?.addCount ??
+    0;
+
+  const currentRemove =
+    dryRunFetcher.data
+      ?.removeCount ??
+    job?.removeCount ??
+    0;
+
+  const currentStatus =
+    isDryRunBusy
+      ? "RUNNING"
+      : job?.status ||
+      "NOT STARTED";
+
+  /*
+  |--------------------------------------------------------------------------
+  | Pagination URLs
+  |--------------------------------------------------------------------------
+  */
+
+  const previousUrl =
     useMemo(() => {
-      if (
-        listTotal === 0
-      ) {
-        return "0";
-      }
-
-      const from =
-        (page - 1) *
-        LIST_PAGE_SIZE +
-        1;
-
-      const to =
-        Math.min(
-          page *
-          LIST_PAGE_SIZE,
-          listTotal,
-        );
-
-      return `${from}-${to}`;
-    }, [
-      page,
-      listTotal,
-    ]);
-
-  /*
-   * Preserve filter during pagination.
-   */
-  const buildListUrl =
-    (
-      nextPage,
-      nextFilter = filter,
-    ) => {
       const params =
-        new URLSearchParams();
+        new URLSearchParams(
+          searchParams,
+        );
 
       params.set(
         "page",
-        String(nextPage),
+        String(
+          Math.max(
+            page - 1,
+            1,
+          ),
+        ),
       );
+
+      return `/app/sale-sync?${params.toString()}`;
+    }, [
+      page,
+      searchParams,
+    ]);
+
+  const nextUrl =
+    useMemo(() => {
+      const params =
+        new URLSearchParams(
+          searchParams,
+        );
 
       params.set(
-        "filter",
-        nextFilter,
+        "page",
+        String(
+          page + 1,
+        ),
       );
 
-      return `?${params.toString()}`;
-    };
+      return `/app/sale-sync?${params.toString()}`;
+    }, [
+      page,
+      searchParams,
+    ]);
+
+  /*
+  |--------------------------------------------------------------------------
+  | Render
+  |--------------------------------------------------------------------------
+  */
 
   return (
     <s-page heading="SALE badge sync">
+      {/*
+      |--------------------------------------------------------------------------
+      | DRY RUN
+      |--------------------------------------------------------------------------
+      */}
+
       <s-section heading="Full catalog dry run">
         <s-paragraph>
           This scan does not change Shopify data.
-          It checks the full variant catalog in pages
-          of 250 and stores only variants that require
-          a SALE badge change.
+          It checks the full variant catalog in
+          pages of {SHOPIFY_PAGE_SIZE} and stores
+          only variants that require a SALE badge
+          change.
         </s-paragraph>
 
-        {/* CONTROLS */}
-
         <div
           style={{
-            display: "flex",
-            gap: "12px",
-            flexWrap: "wrap",
-            marginTop: "18px",
-            marginBottom: "18px",
+            marginTop:
+              "18px",
           }}
         >
-          {canStart && (
-            <button
-              type="button"
-              disabled={
-                isSubmitting
-              }
-              onClick={() => {
-                setAutoRunning(
-                  true,
-                );
+          <button
+            type="button"
+            disabled={
+              isDryRunBusy ||
+              isApplyBusy
+            }
+            onClick={
+              startDryRun
+            }
+            style={{
+              ...primaryButtonStyle,
 
-                scanFetcher.submit(
-                  {
-                    intent:
-                      "startDryRun",
-                  },
-                  {
-                    method:
-                      "post",
-                  },
-                );
-              }}
-              style={
-                primaryButtonStyle
-              }
-            >
-              {isSubmitting
-                ? "Starting..."
-                : "Start full dry run"}
-            </button>
-          )}
+              opacity:
+                isDryRunBusy ||
+                isApplyBusy
+                  ? 0.5
+                  : 1,
 
-          {canResume &&
-            !autoRunning && (
-              <button
-                type="button"
-                disabled={
-                  isSubmitting
-                }
-                onClick={() => {
-                  setAutoRunning(
-                    true,
-                  );
-                }}
-                style={
-                  primaryButtonStyle
-                }
-              >
-                Resume dry run
-              </button>
-            )}
-
-          {autoRunning && (
-            <button
-              type="button"
-              onClick={() => {
-                setAutoRunning(
-                  false,
-                );
-              }}
-              style={
-                secondaryButtonStyle
-              }
-            >
-              Pause browser processing
-            </button>
-          )}
+              cursor:
+                isDryRunBusy ||
+                isApplyBusy
+                  ? "not-allowed"
+                  : "pointer",
+            }}
+          >
+            {isDryRunBusy
+              ? "Scanning catalog..."
+              : "Start full dry run"}
+          </button>
         </div>
 
-        {/* STATISTICS */}
-
         <div
-          style={{
-            display: "grid",
-
-            gridTemplateColumns:
-              "repeat(auto-fit, minmax(160px, 1fr))",
-
-            gap: "12px",
-
-            marginBottom:
-              "20px",
-          }}
+          style={
+            statsGridStyle
+          }
         >
           <StatCard
             label="Status"
             value={
-              status
+              currentStatus
             }
           />
 
           <StatCard
             label="Variants checked"
             value={
-              liveJob?.checked ??
-              0
+              currentChecked
             }
           />
 
           <StatCard
             label="Products affected"
             value={
-              affectedProducts
+              job?.status ===
+              "COMPLETED"
+                ? affectedProducts
+                : "-"
             }
           />
 
           <StatCard
             label="Variants to change"
             value={
-              liveJob?.changes ??
-              0
+              currentChanges
             }
           />
 
           <StatCard
             label="ADD SALE"
             value={
-              liveJob?.addCount ??
-              0
+              currentAdd
             }
           />
 
           <StatCard
             label="REMOVE SALE"
             value={
-              liveJob?.removeCount ??
-              0
+              currentRemove
             }
           />
 
           <StatCard
             label="Errors"
             value={
-              liveJob?.failed ??
+              job?.errors ??
               0
             }
           />
         </div>
 
-        {/* PROGRESS */}
-
-        {(progressMessage ||
-          autoRunning) && (
+        {dryRunMessage && (
           <div
-            style={{
-              marginBottom:
-                "18px",
-
-              padding:
-                "12px 14px",
-
-              border:
-                "1px solid #c9cccf",
-
-              borderRadius:
-                "8px",
-
-              background:
-                "#f6f6f7",
-            }}
+            style={
+              dryRunFetcher.data
+                ?.success ===
+              false
+                ? errorBoxStyle
+                : infoBoxStyle
+            }
           >
-            {autoRunning &&
-            status ===
-            "RUNNING"
-              ? "Scanning catalog automatically. Keep this page open."
-              : progressMessage}
+            {dryRunMessage}
           </div>
         )}
 
-        {/* ERROR */}
-
-        {liveJob?.lastError && (
+        {isDryRunBusy && (
           <div
             style={{
-              marginBottom:
-                "18px",
-
-              padding:
-                "12px 14px",
-
-              border:
-                "1px solid #d82c0d",
-
-              borderRadius:
-                "8px",
-
-              background:
-                "#fff4f4",
+              marginTop:
+                "16px",
             }}
           >
-            <strong>
-              Last error:
-            </strong>{" "}
-            {
-              liveJob.lastError
-            }
+            <ProgressBar
+              current={
+                currentChecked
+              }
+              indeterminate
+            />
           </div>
         )}
       </s-section>
 
-      {/* RESULTS */}
+      {/*
+      |--------------------------------------------------------------------------
+      | RESULT LIST
+      |--------------------------------------------------------------------------
+      */}
 
-      <s-section heading="Detected changes">
-        {!job ? (
-          <s-paragraph>
-            Run the full dry run first. No Shopify data
-            will be changed.
-          </s-paragraph>
-        ) : (
-          <>
-            {/* FILTERS */}
-
-            <div
-              style={{
-                display:
-                  "flex",
-
-                gap:
-                  "10px",
-
-                flexWrap:
-                  "wrap",
-
-                marginBottom:
-                  "16px",
-              }}
-            >
-              <FilterLink
-                active={
-                  filter ===
-                  "ALL"
-                }
-                to={
-                  buildListUrl(
-                    1,
-                    "ALL",
-                  )
-                }
-              >
-                All (
+      {job?.status ===
+        "COMPLETED" && (
+          <s-section heading="Variants requiring changes">
+            <s-paragraph>
+              Dry run found{" "}
+              <strong>
+                {job.changes}
+              </strong>{" "}
+              variants across{" "}
+              <strong>
                 {
-                  job.changes
+                  affectedProducts
                 }
-                )
-              </FilterLink>
-
-              <FilterLink
-                active={
-                  filter ===
-                  "ADD_SALE"
-                }
-                to={
-                  buildListUrl(
-                    1,
-                    "ADD_SALE",
-                  )
-                }
-              >
-                ADD SALE (
-                {
-                  job.addCount
-                }
-                )
-              </FilterLink>
-
-              <FilterLink
-                active={
-                  filter ===
-                  "REMOVE_SALE"
-                }
-                to={
-                  buildListUrl(
-                    1,
-                    "REMOVE_SALE",
-                  )
-                }
-              >
-                REMOVE SALE (
-                {
-                  job.removeCount
-                }
-                )
-              </FilterLink>
-            </div>
-
-            <div
-              style={{
-                marginBottom:
-                  "12px",
-              }}
-            >
-              Showing{" "}
-              {shownRange} of{" "}
-              {listTotal}
-            </div>
-
-            {/* TABLE */}
+              </strong>{" "}
+              products that require
+              a SALE badge update.
+            </s-paragraph>
 
             {items.length ===
             0 ? (
               <div
                 style={{
+                  marginTop:
+                    "18px",
+
                   padding:
-                    "20px",
+                    "18px",
 
                   border:
                     "1px solid #ddd",
@@ -1487,214 +2021,570 @@ export default function SaleSyncPage() {
                     "8px",
                 }}
               >
-                No detected changes
-                for this filter.
+                No incorrect SALE
+                badge states were
+                found.
               </div>
             ) : (
-              <div
-                style={{
-                  overflowX:
-                    "auto",
-                }}
-              >
-                <table
+              <>
+                <div
                   style={{
-                    width:
-                      "100%",
+                    overflowX:
+                      "auto",
 
-                    borderCollapse:
-                      "collapse",
+                    marginTop:
+                      "18px",
                   }}
                 >
-                  <thead>
-                  <tr>
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      Product
-                    </th>
+                  <table
+                    style={{
+                      width:
+                        "100%",
 
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      Variant
-                    </th>
-
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      SKU
-                    </th>
-
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      Price
-                    </th>
-
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      Compare at
-                    </th>
-
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      On sale?
-                    </th>
-
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      SALE badge?
-                    </th>
-
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      Action
-                    </th>
-
-                    <th
-                      style={
-                        cellStyle
-                      }
-                    >
-                      Admin
-                    </th>
-                  </tr>
-                  </thead>
-
-                  <tbody>
-                  {items.map(
-                    (item) => (
-                      <tr
-                        key={
-                          item.id
+                      borderCollapse:
+                        "collapse",
+                    }}
+                  >
+                    <thead>
+                    <tr>
+                      <th
+                        style={
+                          cellStyle
                         }
                       >
-                        <td
-                          style={
-                            cellStyle
-                          }
-                        >
-                          {
-                            item.productTitle
-                          }
-                        </td>
+                        Product
+                      </th>
 
-                        <td
-                          style={
-                            cellStyle
-                          }
-                        >
-                          {
-                            item.variantTitle
-                          }
-                        </td>
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        Variant
+                      </th>
 
-                        <td
-                          style={
-                            cellStyle
-                          }
-                        >
-                          {item.sku ||
-                            "-"}
-                        </td>
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        Variant ID
+                      </th>
 
-                        <td
-                          style={
-                            cellStyle
-                          }
-                        >
-                          {
-                            item.price
-                          }
-                        </td>
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        SKU
+                      </th>
 
-                        <td
-                          style={
-                            cellStyle
-                          }
-                        >
-                          {item.compareAtPrice ||
-                            "-"}
-                        </td>
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        Price
+                      </th>
 
-                        <td
-                          style={
-                            cellStyle
-                          }
-                        >
-                          {item.isOnSale
-                            ? "YES"
-                            : "NO"}
-                        </td>
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        Compare at
+                      </th>
 
-                        <td
-                          style={
-                            cellStyle
-                          }
-                        >
-                          {item.hasSaleBadge
-                            ? "YES"
-                            : "NO"}
-                        </td>
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        On sale?
+                      </th>
 
-                        <td
-                          style={
-                            cellStyle
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        SALE badge?
+                      </th>
+
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        Action
+                      </th>
+
+                      <th
+                        style={
+                          cellStyle
+                        }
+                      >
+                        Product
+                      </th>
+                    </tr>
+                    </thead>
+
+                    <tbody>
+                    {items.map(
+                      (
+                        item,
+                      ) => (
+                        <tr
+                          key={
+                            item.id
                           }
                         >
-                          <strong>
-                            {
-                              item.action
+                          <td
+                            style={
+                              cellStyle
                             }
-                          </strong>
-                        </td>
+                          >
+                            {
+                              item.productTitle
+                            }
+                          </td>
 
-                        <td
-                          style={
-                            cellStyle
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            {
+                              item.variantTitle
+                            }
+                          </td>
+
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            {getNumericId(
+                              item.variantId,
+                            )}
+                          </td>
+
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            {item.sku ||
+                              "-"}
+                          </td>
+
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            {
+                              item.price
+                            }
+                          </td>
+
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            {item.compareAtPrice ||
+                              "-"}
+                          </td>
+
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            {item.isOnSale
+                              ? "YES"
+                              : "NO"}
+                          </td>
+
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            {item.hasSaleBadge
+                              ? "YES"
+                              : "NO"}
+                          </td>
+
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            <strong>
+                              {
+                                item.action
+                              }
+                            </strong>
+                          </td>
+
+                          <td
+                            style={
+                              cellStyle
+                            }
+                          >
+                            <a
+                              href={`shopify://admin/products/${getNumericId(
+                                item.productId,
+                              )}`}
+                              target="_top"
+                            >
+                              Open
+                            </a>
+                          </td>
+                        </tr>
+                      ),
+                    )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {totalPages >
+                  1 && (
+                    <div
+                      style={
+                        paginationStyle
+                      }
+                    >
+                      {page >
+                      1 ? (
+                        <a
+                          href={
+                            previousUrl
                           }
                         >
-                          <a
-                            href={`https://admin.shopify.com/store/${storeHandle}/products/${item.productNumericId}/variants/${item.variantNumericId}`}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Open
-                          </a>
-                        </td>
-                      </tr>
-                    ),
+                          Previous
+                        </a>
+                      ) : (
+                        <span
+                          style={{
+                            opacity:
+                              0.45,
+                          }}
+                        >
+                      Previous
+                    </span>
+                      )}
+
+                      <strong>
+                        Page {page} of{" "}
+                        {
+                          totalPages
+                        }
+                      </strong>
+
+                      {page <
+                      totalPages ? (
+                        <a
+                          href={
+                            nextUrl
+                          }
+                        >
+                          Next
+                        </a>
+                      ) : (
+                        <span
+                          style={{
+                            opacity:
+                              0.45,
+                          }}
+                        >
+                      Next
+                    </span>
+                      )}
+                    </div>
                   )}
-                  </tbody>
-                </table>
-              </div>
+              </>
             )}
 
-            {/* PAGINATION */}
+            {/*
+          |--------------------------------------------------------------------------
+          | APPLY ALL BLOCK
+          |--------------------------------------------------------------------------
+          */}
 
-            {totalPages >
-              1 && (
+            <div
+              style={
+                applyBlockStyle
+              }
+            >
+              <h2
+                style={{
+                  margin:
+                    "0 0 8px",
+                }}
+              >
+                Apply SALE badge
+                changes
+              </h2>
+
+              <p
+                style={{
+                  margin:
+                    "0 0 18px",
+
+                  lineHeight:
+                    1.5,
+                }}
+              >
+                {job?.status ===
+                "COMPLETED" ? (
+                  <>
+                    The completed
+                    dry run found{" "}
+                    <strong>
+                      {
+                        job.changes
+                      }
+                    </strong>{" "}
+                    variants across{" "}
+                    <strong>
+                      {
+                        affectedProducts
+                      }
+                    </strong>{" "}
+                    products that
+                    require an
+                    update.
+                  </>
+                ) : (
+                  <>
+                    Run and
+                    complete the
+                    full catalog
+                    dry run before
+                    applying SALE
+                    badge changes.
+                  </>
+                )}
+              </p>
+
+              <div
+                style={{
+                  display:
+                    "grid",
+
+                  gridTemplateColumns:
+                    "repeat(auto-fit, minmax(150px, 1fr))",
+
+                  gap:
+                    "12px",
+
+                  marginBottom:
+                    "20px",
+                }}
+              >
+                <StatCard
+                  label="Products"
+                  value={
+                    job?.status ===
+                    "COMPLETED"
+                      ? affectedProducts
+                      : "-"
+                  }
+                />
+
+                <StatCard
+                  label="Variants"
+                  value={
+                    job?.status ===
+                    "COMPLETED"
+                      ? job.changes
+                      : "-"
+                  }
+                />
+
+                <StatCard
+                  label="ADD SALE"
+                  value={
+                    job?.status ===
+                    "COMPLETED"
+                      ? job.addCount
+                      : "-"
+                  }
+                />
+
+                <StatCard
+                  label="REMOVE SALE"
+                  value={
+                    job?.status ===
+                    "COMPLETED"
+                      ? job.removeCount
+                      : "-"
+                  }
+                />
+              </div>
+
+              <div
+                style={{
+                  marginBottom:
+                    "18px",
+
+                  padding:
+                    "12px 14px",
+
+                  background:
+                    "#f6f6f7",
+
+                  border:
+                    "1px solid #ddd",
+
+                  borderRadius:
+                    "8px",
+
+                  lineHeight:
+                    1.5,
+                }}
+              >
+                Each variant is
+                re-read from Shopify
+                immediately before
+                the update. If its
+                price or SALE badge
+                state has changed
+                since the dry run,
+                the current state is
+                used.
+              </div>
+
+              {applyProgress && (
+                <div
+                  style={{
+                    marginBottom:
+                      "20px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display:
+                        "grid",
+
+                      gridTemplateColumns:
+                        "repeat(auto-fit, minmax(140px, 1fr))",
+
+                      gap:
+                        "10px",
+
+                      marginBottom:
+                        "14px",
+                    }}
+                  >
+                    <StatCard
+                      label="Processed"
+                      value={`${applyProgress.processed} / ${applyProgress.total}`}
+                    />
+
+                    <StatCard
+                      label="Updated"
+                      value={
+                        applyProgress.updated
+                      }
+                    />
+
+                    <StatCard
+                      label="Added SALE"
+                      value={
+                        applyProgress.added
+                      }
+                    />
+
+                    <StatCard
+                      label="Removed SALE"
+                      value={
+                        applyProgress.removed
+                      }
+                    />
+
+                    <StatCard
+                      label="Skipped"
+                      value={
+                        applyProgress.skipped
+                      }
+                    />
+
+                    <StatCard
+                      label="Failed"
+                      value={
+                        applyProgress.failed
+                      }
+                    />
+                  </div>
+
+                  <ProgressBar
+                    current={
+                      applyProgress.processed
+                    }
+                    total={
+                      applyProgress.total
+                    }
+                  />
+                </div>
+              )}
+
+              {applyMessage && (
+                <div
+                  style={
+                    applyFetcher
+                      .data
+                      ?.success
+                      ? successBoxStyle
+                      : errorBoxStyle
+                  }
+                >
+                  {
+                    applyMessage
+                  }
+                </div>
+              )}
+
+              {!applyProgress && (
+                <button
+                  type="button"
+                  disabled={
+                    !canApply ||
+                    isApplyBusy
+                  }
+                  onClick={
+                    startApply
+                  }
+                  style={{
+                    ...dangerButtonStyle,
+
+                    opacity:
+                      !canApply ||
+                      isApplyBusy
+                        ? 0.5
+                        : 1,
+
+                    cursor:
+                      !canApply ||
+                      isApplyBusy
+                        ? "not-allowed"
+                        : "pointer",
+                  }}
+                >
+                  {job?.status !==
+                  "COMPLETED"
+                    ? "Complete dry run first"
+                    : job.changes ===
+                    0
+                      ? "No products to update"
+                      : "Update all products"}
+                </button>
+              )}
+
+              {autoApplying && (
                 <div
                   style={{
                     display:
@@ -1706,61 +2596,161 @@ export default function SaleSyncPage() {
                     gap:
                       "12px",
 
-                    marginTop:
-                      "18px",
+                    flexWrap:
+                      "wrap",
                   }}
                 >
-                  {page > 1 ? (
-                    <Link
-                      to={
-                        buildListUrl(
-                          page -
-                          1,
-                        )
-                      }
-                    >
-                      Previous
-                    </Link>
-                  ) : (
-                    <span>
-                    Previous
-                  </span>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAutoApplying(
+                        false,
+                      );
+                    }}
+                    style={
+                      secondaryButtonStyle
+                    }
+                  >
+                    Pause updates
+                  </button>
 
                   <strong>
-                    Page {page} of{" "}
-                    {totalPages}
+                    Updating
+                    products...
                   </strong>
-
-                  {page <
-                  totalPages ? (
-                    <Link
-                      to={
-                        buildListUrl(
-                          page +
-                          1,
-                        )
-                      }
-                    >
-                      Next
-                    </Link>
-                  ) : (
-                    <span>
-                    Next
-                  </span>
-                  )}
                 </div>
               )}
-          </>
+
+              {applyProgress &&
+                !applyProgress.completed &&
+                !autoApplying && (
+                  <div
+                    style={{
+                      display:
+                        "flex",
+
+                      gap:
+                        "12px",
+
+                      flexWrap:
+                        "wrap",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      disabled={
+                        applyFetcher.state !==
+                        "idle"
+                      }
+                      onClick={
+                        resumeApply
+                      }
+                      style={
+                        primaryButtonStyle
+                      }
+                    >
+                      {applyProgress.halted
+                        ? "Retry / Resume updates"
+                        : "Resume updates"}
+                    </button>
+                  </div>
+                )}
+
+              {applyProgress
+                ?.completed && (
+                <div
+                  style={{
+                    marginTop:
+                      "16px",
+
+                    padding:
+                      "16px",
+
+                    border:
+                      "1px solid #008060",
+
+                    background:
+                      "#f1f8f5",
+
+                    borderRadius:
+                      "8px",
+
+                    lineHeight:
+                      1.5,
+                  }}
+                >
+                  <strong>
+                    Update
+                    completed.
+                  </strong>
+
+                  <div
+                    style={{
+                      marginTop:
+                        "6px",
+                    }}
+                  >
+                    Run a new Full
+                    catalog dry run
+                    to verify the
+                    current state of
+                    the entire
+                    store.
+                  </div>
+                </div>
+              )}
+            </div>
+          </s-section>
         )}
-      </s-section>
+
+      {/*
+      |--------------------------------------------------------------------------
+      | Apply block before first Dry Run
+      |--------------------------------------------------------------------------
+      */}
+
+      {job?.status !==
+        "COMPLETED" && (
+          <s-section heading="Apply SALE badge changes">
+            <s-paragraph>
+              Complete a full
+              catalog dry run
+              before applying any
+              SALE badge changes.
+            </s-paragraph>
+
+            <div
+              style={{
+                marginTop:
+                  "18px",
+              }}
+            >
+              <button
+                type="button"
+                disabled
+                style={{
+                  ...dangerButtonStyle,
+
+                  opacity:
+                    0.5,
+
+                  cursor:
+                    "not-allowed",
+                }}
+              >
+                Complete dry run
+                first
+              </button>
+            </div>
+          </s-section>
+        )}
     </s-page>
   );
 }
 
 /*
 |--------------------------------------------------------------------------
-| SMALL UI COMPONENTS
+| Components
 |--------------------------------------------------------------------------
 */
 
@@ -1771,14 +2761,14 @@ function StatCard({
   return (
     <div
       style={{
-        padding:
-          "14px",
-
         border:
           "1px solid #ddd",
 
         borderRadius:
-          "8px",
+          "10px",
+
+        padding:
+          "14px 16px",
 
         background:
           "#fff",
@@ -1787,10 +2777,10 @@ function StatCard({
       <div
         style={{
           fontSize:
-            "12px",
+            "13px",
 
-          opacity:
-            0.7,
+          color:
+            "#616161",
 
           marginBottom:
             "6px",
@@ -1799,76 +2789,125 @@ function StatCard({
         {label}
       </div>
 
-      <strong
+      <div
         style={{
           fontSize:
-            "20px",
+            "24px",
+
+          fontWeight:
+            700,
         }}
       >
         {value}
-      </strong>
+      </div>
     </div>
   );
 }
 
-function FilterLink({
-                      active,
-                      to,
-                      children,
-                    }) {
+function ProgressBar({
+                       current = 0,
+                       total = 0,
+                       indeterminate = false,
+                     }) {
+  let percentage = 0;
+
+  if (
+    !indeterminate &&
+    total > 0
+  ) {
+    percentage =
+      Math.min(
+        100,
+        Math.round(
+          (current /
+            total) *
+          100,
+        ),
+      );
+  }
+
   return (
-    <Link
-      to={to}
-      style={{
-        display:
-          "inline-block",
+    <div>
+      {!indeterminate && (
+        <div
+          style={{
+            marginBottom:
+              "6px",
 
-        padding:
-          "8px 12px",
+            fontSize:
+              "13px",
+          }}
+        >
+          {percentage}%
+        </div>
+      )}
 
-        border:
-          "1px solid #c9cccf",
+      <div
+        style={{
+          width:
+            "100%",
 
-        borderRadius:
-          "8px",
+          height:
+            "10px",
 
-        textDecoration:
-          "none",
+          background:
+            "#e1e3e5",
 
-        fontWeight:
-          active
-            ? 700
-            : 400,
+          borderRadius:
+            "999px",
 
-        background:
-          active
-            ? "#f1f8f5"
-            : "#fff",
-      }}
-    >
-      {children}
-    </Link>
+          overflow:
+            "hidden",
+        }}
+      >
+        <div
+          style={{
+            width:
+              indeterminate
+                ? "35%"
+                : `${percentage}%`,
+
+            height:
+              "100%",
+
+            background:
+              "#303030",
+
+            borderRadius:
+              "999px",
+
+            transition:
+              "width 0.2s ease",
+          }}
+        />
+      </div>
+    </div>
   );
 }
 
-const primaryButtonStyle = {
-  padding:
-    "10px 16px",
+/*
+|--------------------------------------------------------------------------
+| Utility
+|--------------------------------------------------------------------------
+*/
 
-  fontWeight:
-    600,
+function getNumericId(
+  gid,
+) {
+  if (!gid) {
+    return "";
+  }
 
-  cursor:
-    "pointer",
-};
+  return gid
+    .split("/")
+    .pop();
+}
 
-const secondaryButtonStyle = {
-  padding:
-    "10px 16px",
-
-  cursor:
-    "pointer",
-};
+/*
+|--------------------------------------------------------------------------
+| Styles
+|--------------------------------------------------------------------------
+*/
 
 const cellStyle = {
   padding:
@@ -1882,4 +2921,181 @@ const cellStyle = {
 
   whiteSpace:
     "nowrap",
+
+  verticalAlign:
+    "middle",
+};
+
+const statsGridStyle = {
+  display:
+    "grid",
+
+  gridTemplateColumns:
+    "repeat(auto-fit, minmax(160px, 1fr))",
+
+  gap:
+    "12px",
+
+  marginTop:
+    "20px",
+
+  marginBottom:
+    "20px",
+};
+
+const paginationStyle = {
+  display:
+    "flex",
+
+  alignItems:
+    "center",
+
+  gap:
+    "14px",
+
+  marginTop:
+    "18px",
+
+  flexWrap:
+    "wrap",
+};
+
+const applyBlockStyle = {
+  marginTop:
+    "28px",
+
+  padding:
+    "20px",
+
+  border:
+    "1px solid #d9d9d9",
+
+  borderRadius:
+    "10px",
+
+  background:
+    "#fff",
+};
+
+const primaryButtonStyle = {
+  padding:
+    "10px 18px",
+
+  border:
+    "1px solid #303030",
+
+  borderRadius:
+    "6px",
+
+  background:
+    "#303030",
+
+  color:
+    "#fff",
+
+  fontWeight:
+    600,
+
+  cursor:
+    "pointer",
+};
+
+const secondaryButtonStyle = {
+  padding:
+    "10px 18px",
+
+  border:
+    "1px solid #8c9196",
+
+  borderRadius:
+    "6px",
+
+  background:
+    "#fff",
+
+  color:
+    "#202223",
+
+  fontWeight:
+    600,
+
+  cursor:
+    "pointer",
+};
+
+const dangerButtonStyle = {
+  padding:
+    "11px 20px",
+
+  border:
+    "1px solid #8e1f0b",
+
+  borderRadius:
+    "6px",
+
+  background:
+    "#b42318",
+
+  color:
+    "#fff",
+
+  fontWeight:
+    700,
+
+  cursor:
+    "pointer",
+};
+
+const infoBoxStyle = {
+  marginTop:
+    "16px",
+
+  padding:
+    "14px 16px",
+
+  border:
+    "1px solid #c9cccf",
+
+  borderRadius:
+    "8px",
+
+  background:
+    "#f6f6f7",
+};
+
+const successBoxStyle = {
+  marginBottom:
+    "16px",
+
+  padding:
+    "14px 16px",
+
+  border:
+    "1px solid #008060",
+
+  borderRadius:
+    "8px",
+
+  background:
+    "#f1f8f5",
+};
+
+const errorBoxStyle = {
+  marginTop:
+    "16px",
+
+  marginBottom:
+    "16px",
+
+  padding:
+    "14px 16px",
+
+  border:
+    "1px solid #d72c0d",
+
+  borderRadius:
+    "8px",
+
+  background:
+    "#fff4f4",
 };
