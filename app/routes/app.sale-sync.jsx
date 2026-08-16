@@ -13,7 +13,10 @@ export const loader = async ({ request }) => {
   const response = await admin.graphql(
     `#graphql
       query SaleBadgeDryRun {
-        productVariants(first: 10, sortKey: ID) {
+        productVariants(
+          first: 250
+          sortKey: ID
+        ) {
           nodes {
             id
             title
@@ -35,6 +38,11 @@ export const loader = async ({ request }) => {
               value
             }
           }
+
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
         }
       }
     `,
@@ -43,138 +51,249 @@ export const loader = async ({ request }) => {
   const json = await response.json();
 
   if (json.errors) {
-    throw new Response(JSON.stringify(json.errors), {
-      status: 500,
-    });
+    console.error(json.errors);
+
+    throw new Response(
+      JSON.stringify(json.errors),
+      { status: 500 },
+    );
   }
 
-  const variants = json.data.productVariants.nodes.map((variant) => {
-    let badges = [];
+  const allVariants =
+    json.data.productVariants.nodes.map((variant) => {
+      let badges = [];
 
-    if (variant.metafield?.value) {
-      try {
-        badges = JSON.parse(variant.metafield.value);
-      } catch {
-        badges = [];
+      if (variant.metafield?.value) {
+        try {
+          badges = JSON.parse(
+            variant.metafield.value,
+          );
+        } catch {
+          badges = [];
+        }
       }
-    }
 
-    const price = Number(variant.price);
+      const price = Number(variant.price);
 
-    const compareAtPrice =
-      variant.compareAtPrice !== null
-        ? Number(variant.compareAtPrice)
-        : null;
+      const compareAtPrice =
+        variant.compareAtPrice !== null
+          ? Number(variant.compareAtPrice)
+          : null;
 
-    const isOnSale =
-      compareAtPrice !== null &&
-      compareAtPrice > price;
+      const isOnSale =
+        compareAtPrice !== null &&
+        compareAtPrice > price;
 
-    const hasSaleBadge =
-      badges.includes(SALE_BADGE_GID);
+      const hasSaleBadge =
+        badges.includes(SALE_BADGE_GID);
 
-    let action = "NONE";
+      let action = "NONE";
 
-    if (isOnSale && !hasSaleBadge) {
-      action = "ADD_SALE";
-    }
+      if (isOnSale && !hasSaleBadge) {
+        action = "ADD_SALE";
+      }
 
-    if (!isOnSale && hasSaleBadge) {
-      action = "REMOVE_SALE";
-    }
+      if (!isOnSale && hasSaleBadge) {
+        action = "REMOVE_SALE";
+      }
 
-    return {
-      id: variant.id,
-      productTitle: variant.product.title,
-      variantTitle: variant.title,
-      sku: variant.sku,
-      price: variant.price,
-      compareAtPrice: variant.compareAtPrice,
-      badges,
-      isOnSale,
-      hasSaleBadge,
-      action,
-    };
-  });
+      return {
+        id: variant.id,
+        productTitle: variant.product.title,
+        variantTitle: variant.title,
+        sku: variant.sku,
+        price: variant.price,
+        compareAtPrice: variant.compareAtPrice,
+        badges,
+        isOnSale,
+        hasSaleBadge,
+        action,
+      };
+    });
+
+  const variantsWithProblems =
+    allVariants.filter(
+      (variant) => variant.action !== "NONE",
+    );
+
+  const addCount =
+    variantsWithProblems.filter(
+      (variant) => variant.action === "ADD_SALE",
+    ).length;
+
+  const removeCount =
+    variantsWithProblems.filter(
+      (variant) => variant.action === "REMOVE_SALE",
+    ).length;
 
   return {
-    variants,
+    variants: variantsWithProblems,
+    stats: {
+      checked: allVariants.length,
+      problems: variantsWithProblems.length,
+      add: addCount,
+      remove: removeCount,
+    },
+    pageInfo: json.data.productVariants.pageInfo,
   };
 };
 
 export default function SaleSyncPage() {
-  const { variants } = useLoaderData();
+  const {
+    variants,
+    stats,
+    pageInfo,
+  } = useLoaderData();
 
   return (
     <s-page heading="SALE badge sync">
       <s-section heading="Dry run">
         <s-paragraph>
-          No data is changed. The first 10 variants are only analysed.
+          No data is changed. The first 250 variants
+          are analysed and only incorrect SALE badge
+          states are displayed.
         </s-paragraph>
 
         <div
           style={{
-            overflowX: "auto",
+            display: "flex",
+            gap: "20px",
             marginTop: "20px",
+            marginBottom: "20px",
+            flexWrap: "wrap",
           }}
         >
-          <table
+          <strong>
+            Checked: {stats.checked}
+          </strong>
+
+          <strong>
+            Problems: {stats.problems}
+          </strong>
+
+          <strong>
+            Add SALE: {stats.add}
+          </strong>
+
+          <strong>
+            Remove SALE: {stats.remove}
+          </strong>
+        </div>
+
+        {variants.length === 0 ? (
+          <div
             style={{
-              width: "100%",
-              borderCollapse: "collapse",
+              padding: "20px",
+              border: "1px solid #ddd",
+              borderRadius: "8px",
             }}
           >
-            <thead>
-            <tr>
-              <th style={cellStyle}>Product</th>
-              <th style={cellStyle}>Variant</th>
-              <th style={cellStyle}>SKU</th>
-              <th style={cellStyle}>Price</th>
-              <th style={cellStyle}>Compare at</th>
-              <th style={cellStyle}>On sale?</th>
-              <th style={cellStyle}>SALE badge?</th>
-              <th style={cellStyle}>Action</th>
-            </tr>
-            </thead>
+            No incorrect SALE badges were found
+            in these variants.
+          </div>
+        ) : (
+          <div
+            style={{
+              overflowX: "auto",
+            }}
+          >
+            <table
+              style={{
+                width: "100%",
+                borderCollapse: "collapse",
+              }}
+            >
+              <thead>
+              <tr>
+                <th style={cellStyle}>
+                  Product
+                </th>
 
-            <tbody>
-            {variants.map((variant) => (
-              <tr key={variant.id}>
-                <td style={cellStyle}>
-                  {variant.productTitle}
-                </td>
+                <th style={cellStyle}>
+                  Variant
+                </th>
 
-                <td style={cellStyle}>
-                  {variant.variantTitle}
-                </td>
+                <th style={cellStyle}>
+                  SKU
+                </th>
 
-                <td style={cellStyle}>
-                  {variant.sku || "-"}
-                </td>
+                <th style={cellStyle}>
+                  Price
+                </th>
 
-                <td style={cellStyle}>
-                  {variant.price}
-                </td>
+                <th style={cellStyle}>
+                  Compare at
+                </th>
 
-                <td style={cellStyle}>
-                  {variant.compareAtPrice || "-"}
-                </td>
+                <th style={cellStyle}>
+                  On sale?
+                </th>
 
-                <td style={cellStyle}>
-                  {variant.isOnSale ? "YES" : "NO"}
-                </td>
+                <th style={cellStyle}>
+                  SALE badge?
+                </th>
 
-                <td style={cellStyle}>
-                  {variant.hasSaleBadge ? "YES" : "NO"}
-                </td>
-
-                <td style={cellStyle}>
-                  <strong>{variant.action}</strong>
-                </td>
+                <th style={cellStyle}>
+                  Action
+                </th>
               </tr>
-            ))}
-            </tbody>
-          </table>
+              </thead>
+
+              <tbody>
+              {variants.map((variant) => (
+                <tr key={variant.id}>
+                  <td style={cellStyle}>
+                    {variant.productTitle}
+                  </td>
+
+                  <td style={cellStyle}>
+                    {variant.variantTitle}
+                  </td>
+
+                  <td style={cellStyle}>
+                    {variant.sku || "-"}
+                  </td>
+
+                  <td style={cellStyle}>
+                    {variant.price}
+                  </td>
+
+                  <td style={cellStyle}>
+                    {variant.compareAtPrice || "-"}
+                  </td>
+
+                  <td style={cellStyle}>
+                    {variant.isOnSale
+                      ? "YES"
+                      : "NO"}
+                  </td>
+
+                  <td style={cellStyle}>
+                    {variant.hasSaleBadge
+                      ? "YES"
+                      : "NO"}
+                  </td>
+
+                  <td style={cellStyle}>
+                    <strong>
+                      {variant.action}
+                    </strong>
+                  </td>
+                </tr>
+              ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div
+          style={{
+            marginTop: "20px",
+            fontSize: "13px",
+          }}
+        >
+          More variants available:{" "}
+          {pageInfo.hasNextPage ? "YES" : "NO"}
         </div>
       </s-section>
     </s-page>
