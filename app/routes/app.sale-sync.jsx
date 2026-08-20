@@ -102,12 +102,15 @@ function analyseVariant(variant) {
       badges: [],
       isOnSale: false,
       hasSaleBadge: false,
+      discountPercent: 0,
       action: "ERROR",
     };
   }
 
   const price =
-    Number(variant.price);
+    Number(
+      variant.price,
+    );
 
   const compareAtPrice =
     variant.compareAtPrice !== null &&
@@ -134,13 +137,35 @@ function analyseVariant(variant) {
         parsed.badges.includes(
           SALE_BADGE_GID,
         ),
+      discountPercent: 0,
       action: "ERROR",
     };
   }
 
-  const isOnSale =
+  let discountPercent = 0;
+
+  if (
     compareAtPrice !== null &&
-    compareAtPrice > price;
+    compareAtPrice > 0 &&
+    compareAtPrice > price
+  ) {
+    discountPercent =
+      (
+        (
+          compareAtPrice -
+          price
+        ) /
+        compareAtPrice
+      ) *
+      100;
+  }
+
+  /*
+   * SALE only when discount
+   * is at least 1%.
+   */
+  const isOnSale =
+    discountPercent >= 1;
 
   const hasSaleBadge =
     parsed.badges.includes(
@@ -168,6 +193,12 @@ function analyseVariant(variant) {
     badges: parsed.badges,
     price,
     compareAtPrice,
+
+    discountPercent:
+      Number(
+        discountPercent.toFixed(2),
+      ),
+
     isOnSale,
     hasSaleBadge,
     action,
